@@ -1,0 +1,7 @@
+[project]
+name = "sts2harness"
+version = "0.1.0"
+description = "State-scoped CLI harness for STS2MCP"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []

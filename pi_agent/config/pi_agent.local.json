@@ -1,0 +1,8 @@
+{
+  "harness_config": "sts2harness.json",
+  "memory_root": "pi_agent/memory",
+  "base_url": "http://localhost:15526",
+  "timeout": 30,
+  "mcp_delay": 1.0,
+  "wait_after_action": 2.0
+}

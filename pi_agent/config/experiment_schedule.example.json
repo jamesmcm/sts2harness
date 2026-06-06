@@ -1,0 +1,22 @@
+{
+  "notes": "Use this as the balanced queue for the external experiment orchestrator.",
+  "llms": [
+    "deepseek-v4-flash",
+    "kimi-v2.6",
+    "minimax-2.7",
+    "gpt-5.5-medium"
+  ],
+  "critical_conditions": [
+    "minimal_raw_no_memory_no_tools",
+    "strong_prompt_no_memory_no_tools",
+    "strong_prompt_memory_files_fs_tools",
+    "strong_prompt_no_memory_fs_tools",
+    "strong_prompt_memory_files_full_local_tools",
+    "custom_pi_memory_context"
+  ],
+  "seed_regimes": [
+    "fixed_until_win",
+    "fixed_list_until_win"
+  ],
+  "interleaving": "Run each LLM through a balanced rotating queue of conditions instead of completing one condition before starting the next."
+}

@@ -1,0 +1,29 @@
+{
+  "agent": {
+    "agent_name": "local-debug",
+    "model_name": "manual",
+    "condition_name": "debug-fixed-seed",
+    "prompt_version": "debug",
+    "memory_version": "none"
+  },
+  "run_setup": {
+    "seed_policy": "fixed_until_win",
+    "seed": "R58NTKJSSE",
+    "ascension": 0,
+    "max_ascension": 10,
+    "stop_after_consecutive_a10_wins": 3,
+    "character": "IRONCLAD",
+    "progress_file": ".sts2harness-progress.json",
+    "save_root": "~/.local/share/SlayTheSpire2/steam",
+    "increment_ascension_on_win": true
+  },
+  "logging": {
+    "official_run_logging": false,
+    "sqlite_path": ".sts2harness-runs.sqlite",
+    "harness_version": "local-debug"
+  },
+  "auto_resolve": {
+    "enabled": true,
+    "max_actions": 10
+  }
+}

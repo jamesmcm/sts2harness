@@ -1,0 +1,35 @@
+{
+  "agent": {
+    "agent_name": "pi-agent",
+    "model_name": "MODEL_NAME_HERE",
+    "condition_name": "custom_pi_memory_context",
+    "prompt_version": "2026-06-06-a",
+    "memory_version": "strategy-v1"
+  },
+  "run_setup": {
+    "seed_policy": "fixed_list_until_win",
+    "seed_set": [
+      "R58NTKJSSE",
+      "SEED000002",
+      "SEED000003",
+      "SEED000004",
+      "SEED000005"
+    ],
+    "ascension": 0,
+    "max_ascension": 10,
+    "stop_after_consecutive_a10_wins": 3,
+    "character": "IRONCLAD",
+    "progress_file": "/var/lib/sts2harness/official/pi-agent-progress.json",
+    "save_root": "~/.local/share/SlayTheSpire2/steam",
+    "increment_ascension_on_win": true
+  },
+  "logging": {
+    "official_run_logging": true,
+    "sqlite_path": "/var/lib/sts2harness/official/sts2-runs.sqlite",
+    "harness_version": "sts2harness-2026-06-06"
+  },
+  "auto_resolve": {
+    "enabled": true,
+    "max_actions": 10
+  }
+}

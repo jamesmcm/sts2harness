@@ -118,40 +118,85 @@ class RunSetupActionTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
-    def test_win_increments_ascension_once(self):
+    def test_history_win_increments_ascension_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             progress_file = str(Path(tmpdir) / "progress.json")
-            setup = main.RunSetup(
-                seed="ABC123", ascension=1, progress_file=progress_file
+            history = (
+                Path(tmpdir)
+                / "steamid"
+                / "modded"
+                / "profile1"
+                / "saves"
+                / "history"
             )
-            client = FakeCompendiumClient(
-                {
-                    "sections": {
-                        "run_history": {
-                            "entries": [
-                                {
-                                    "run_id": "modded:profile1:10",
-                                    "last_write_time_utc": "2026-06-06T10:00:00Z",
-                                    "seed": "ABC123",
-                                    "win": True,
-                                }
-                            ]
-                        }
+            history.mkdir(parents=True)
+            history_file = history / "run1.run"
+            history_file.write_text(
+                json.dumps(
+                    {
+                        "run_id": "modded:profile1:10",
+                        "seed": "ABC123",
+                        "ascension": 1,
+                        "victory": True,
                     }
-                }
+                ),
+                encoding="utf-8",
+            )
+            setup = main.RunSetup(
+                seed="ABC123",
+                ascension=1,
+                progress_file=progress_file,
+                save_root=tmpdir,
             )
 
             first = main.maybe_update_progress_after_state(
-                client, {"state_type": "game_over"}, setup
+                FakeClient([]), {"state_type": "game_over"}, setup
             )
             second = main.maybe_update_progress_after_state(
-                client, {"state_type": "game_over"}, setup
+                FakeClient([]), {"state_type": "game_over"}, setup
             )
 
             self.assertEqual(first["next_ascension"], 2)
             self.assertIsNone(second)
             progress = main._load_json_file(progress_file)
             self.assertEqual(progress["ascension"], 2)
+
+    def test_a10_win_advances_seed_and_stops_after_three(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            progress_file = str(Path(tmpdir) / "progress.json")
+            history = Path(tmpdir) / "saves" / "history"
+            history.mkdir(parents=True)
+            setup = main.RunSetup(
+                seed_set=("S1", "S2", "S3"),
+                ascension=10,
+                progress_file=progress_file,
+                save_root=tmpdir,
+                seed_policy="fixed_list_until_win",
+                max_ascension=10,
+                stop_after_consecutive_a10_wins=3,
+            )
+            for index, seed in enumerate(("S1", "S2", "S3"), start=1):
+                history_file = history / f"run{index}.run"
+                history_file.write_text(
+                    json.dumps(
+                        {
+                            "run_id": f"run-{index}",
+                            "seed": seed,
+                            "ascension": 10,
+                            "victory": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                os.utime(history_file, (1000 + index, 1000 + index))
+                update = main.maybe_update_progress_after_state(
+                    FakeClient([]), {"state_type": "game_over"}, setup
+                )
+                self.assertIsNotNone(update)
+
+            progress = main._load_json_file(progress_file)
+            self.assertEqual(progress["consecutive_a10_wins"], 3)
+            self.assertTrue(progress["stopped"])
 
 
 class CurrentRunVerificationTests(unittest.TestCase):
@@ -199,14 +244,6 @@ class CurrentRunVerificationTests(unittest.TestCase):
             self.assertEqual(verification["actual"]["seed"], "ABC123")
             self.assertEqual(verification["actual"]["ascension"], 4)
             self.assertEqual(verification["actual"]["game_mode"], "custom")
-
-
-class FakeCompendiumClient:
-    def __init__(self, compendium):
-        self.compendium = compendium
-
-    def get_compendium(self):
-        return self.compendium
 
 
 if __name__ == "__main__":

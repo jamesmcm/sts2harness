@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import socket
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -19,6 +22,8 @@ DEFAULT_THROTTLE_FILE = "/tmp/sts2harness-mcp-throttle"
 DEFAULT_CONFIG_FILE = "sts2harness.json"
 DEFAULT_PROGRESS_FILE = ".sts2harness-progress.json"
 DEFAULT_SAVE_ROOT = "~/.local/share/SlayTheSpire2/steam"
+DEFAULT_SEED_POLICY = "fixed_until_win"
+SEED_POLICIES = {"fixed", "fixed_until_win", "fixed_list", "fixed_list_until_win"}
 
 
 JsonDict = dict[str, Any]
@@ -27,11 +32,42 @@ JsonDict = dict[str, Any]
 @dataclass(frozen=True)
 class RunSetup:
     seed: str | None = None
+    seed_set: tuple[str, ...] = ()
+    seed_policy: str = DEFAULT_SEED_POLICY
     ascension: int | None = None
+    max_ascension: int = 10
     character: str | None = None
     progress_file: str = DEFAULT_PROGRESS_FILE
     save_root: str = DEFAULT_SAVE_ROOT
     increment_ascension_on_win: bool = True
+    stop_after_consecutive_a10_wins: int = 3
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    agent_name: str | None = None
+    model_name: str | None = None
+    condition_name: str | None = None
+    prompt_version: str | None = None
+    memory_version: str | None = None
+    memory_checksum: str | None = None
+
+
+@dataclass(frozen=True)
+class LoggingConfig:
+    sqlite_path: str | None = None
+    official_run_logging: bool = False
+    harness_version: str | None = None
+    git_commit: str | None = None
+
+
+@dataclass(frozen=True)
+class HarnessConfig:
+    run_setup: RunSetup
+    agent: AgentConfig = AgentConfig()
+    logging: LoggingConfig = LoggingConfig()
+    auto_resolve: bool = True
+    max_auto_actions: int = 10
 
 
 @dataclass(frozen=True)
@@ -175,29 +211,64 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def load_run_setup(config_path: str) -> RunSetup:
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        return (text,) if text else ()
+    if not isinstance(value, list):
+        raise ValueError("seed_set must be a list of seed strings")
+    seeds = tuple(str(item).strip() for item in value if str(item).strip())
+    return seeds
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def load_harness_config(config_path: str) -> HarnessConfig:
     config = _load_json_file(config_path)
     run_config = config.get("run_setup")
     if not isinstance(run_config, dict):
         run_config = config
 
     seed = run_config.get("seed")
+    seed_set = _string_tuple(run_config.get("seed_set") or run_config.get("seeds"))
+    seed_policy = str(run_config.get("seed_policy") or DEFAULT_SEED_POLICY).strip()
+    if seed_policy not in SEED_POLICIES:
+        raise ValueError(
+            f"seed_policy must be one of {', '.join(sorted(SEED_POLICIES))}"
+        )
     character = run_config.get("character")
     progress_file = str(run_config.get("progress_file") or DEFAULT_PROGRESS_FILE)
     save_root = str(run_config.get("save_root") or DEFAULT_SAVE_ROOT)
+    max_ascension = _optional_int(run_config.get("max_ascension"))
+    if max_ascension is None:
+        max_ascension = 10
+    stop_after_a10 = _optional_int(run_config.get("stop_after_consecutive_a10_wins"))
+    if stop_after_a10 is None:
+        stop_after_a10 = 3
     increment_on_win = run_config.get("increment_ascension_on_win")
     if increment_on_win is None:
         increment_on_win = True
 
     setup = RunSetup(
         seed=str(seed).strip() if seed is not None and str(seed).strip() else None,
+        seed_set=seed_set,
+        seed_policy=seed_policy,
         ascension=_optional_int(run_config.get("ascension")),
+        max_ascension=max_ascension,
         character=str(character).strip().upper()
         if character is not None and str(character).strip()
         else None,
         progress_file=progress_file,
         save_root=save_root,
         increment_ascension_on_win=bool(increment_on_win),
+        stop_after_consecutive_a10_wins=stop_after_a10,
     )
 
     env_seed = os.environ.get("STS2HARNESS_SEED")
@@ -214,9 +285,12 @@ def load_run_setup(config_path: str) -> RunSetup:
             seed=env_seed.strip()
             if env_seed is not None and env_seed.strip()
             else setup.seed,
+            seed_set=setup.seed_set,
+            seed_policy=setup.seed_policy,
             ascension=_optional_int(env_ascension)
             if env_ascension is not None
             else setup.ascension,
+            max_ascension=setup.max_ascension,
             character=env_character.strip().upper()
             if env_character is not None and env_character.strip()
             else setup.character,
@@ -225,6 +299,7 @@ def load_run_setup(config_path: str) -> RunSetup:
             if env_save_root is not None and env_save_root.strip()
             else setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
+            stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
         )
 
     progress = _load_json_file(setup.progress_file)
@@ -232,17 +307,83 @@ def load_run_setup(config_path: str) -> RunSetup:
     if isinstance(current_ascension, int):
         setup = RunSetup(
             seed=setup.seed,
+            seed_set=setup.seed_set,
+            seed_policy=setup.seed_policy,
             ascension=current_ascension,
+            max_ascension=setup.max_ascension,
             character=setup.character,
             progress_file=setup.progress_file,
             save_root=setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
+            stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
         )
     elif setup.ascension is not None:
         progress["ascension"] = setup.ascension
         _write_json_file(setup.progress_file, progress)
 
-    return setup
+    seed = current_seed_for_setup(setup, progress)
+    if seed != setup.seed:
+        setup = RunSetup(
+            seed=seed,
+            seed_set=setup.seed_set,
+            seed_policy=setup.seed_policy,
+            ascension=setup.ascension,
+            max_ascension=setup.max_ascension,
+            character=setup.character,
+            progress_file=setup.progress_file,
+            save_root=setup.save_root,
+            increment_ascension_on_win=setup.increment_ascension_on_win,
+            stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
+        )
+
+    agent_config = config.get("agent")
+    if not isinstance(agent_config, dict):
+        agent_config = {}
+    logging_config = config.get("logging")
+    if not isinstance(logging_config, dict):
+        logging_config = {}
+    auto_config = config.get("auto_resolve")
+    max_auto = config.get("max_auto_actions", 10)
+    if isinstance(auto_config, dict):
+        max_auto = auto_config.get("max_actions", max_auto)
+        auto_config = auto_config.get("enabled", True)
+
+    return HarnessConfig(
+        run_setup=setup,
+        agent=AgentConfig(
+            agent_name=_optional_str(agent_config.get("agent_name")),
+            model_name=_optional_str(agent_config.get("model_name")),
+            condition_name=_optional_str(agent_config.get("condition_name")),
+            prompt_version=_optional_str(agent_config.get("prompt_version")),
+            memory_version=_optional_str(agent_config.get("memory_version")),
+            memory_checksum=_optional_str(agent_config.get("memory_checksum")),
+        ),
+        logging=LoggingConfig(
+            sqlite_path=_optional_str(logging_config.get("sqlite_path")),
+            official_run_logging=bool(logging_config.get("official_run_logging")),
+            harness_version=_optional_str(logging_config.get("harness_version")),
+            git_commit=_optional_str(logging_config.get("git_commit")),
+        ),
+        auto_resolve=bool(auto_config) if auto_config is not None else True,
+        max_auto_actions=int(max_auto),
+    )
+
+
+def load_run_setup(config_path: str) -> RunSetup:
+    return load_harness_config(config_path).run_setup
+
+
+def current_seed_for_setup(
+    run_setup: RunSetup, progress: JsonDict | None = None
+) -> str | None:
+    if progress is None:
+        progress = _load_json_file(run_setup.progress_file)
+    if run_setup.seed_set:
+        index = progress.get("current_seed_index")
+        if not isinstance(index, int) or index < 0:
+            index = 0
+        return run_setup.seed_set[index % len(run_setup.seed_set)]
+    return run_setup.seed
 
 
 def _slug(value: Any) -> str:
@@ -378,6 +519,14 @@ def _menu_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Ac
         else:
             continue
         if not name or not enabled:
+            continue
+
+        if (
+            run_setup is not None
+            and menu_screen == "custom_run"
+            and name.lower() in {"confirm", "embark"}
+            and _load_json_file(run_setup.progress_file).get("stopped") is True
+        ):
             continue
 
         if (
@@ -1071,51 +1220,109 @@ def find_action(actions: list[Action], action_ref: str) -> Action:
     )
 
 
-def _latest_history_entry(compendium: JsonDict) -> JsonDict | None:
-    sections = compendium.get("sections")
-    if not isinstance(sections, dict):
-        return None
-    run_history = sections.get("run_history")
-    if not isinstance(run_history, dict):
-        return None
-    entries = run_history.get("entries")
-    if not isinstance(entries, list) or not entries:
-        return None
+def _extract_run_seed(run: JsonDict) -> str | None:
+    rng = run.get("rng")
+    if isinstance(rng, dict) and rng.get("seed") is not None:
+        return str(rng.get("seed"))
+    for key in ("seed", "run_seed"):
+        if run.get(key) is not None:
+            return str(run.get(key))
+    return None
 
-    dict_entries = [entry for entry in entries if isinstance(entry, dict)]
-    if not dict_entries:
-        return None
 
-    def sort_key(entry: JsonDict) -> tuple[str, str]:
-        return (
-            str(entry.get("last_write_time_utc") or ""),
-            str(entry.get("start_time") or entry.get("id") or ""),
-        )
+def _extract_run_ascension(run: JsonDict) -> int | None:
+    for key in ("ascension", "ascension_level", "ascensionLevel"):
+        value = run.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
-    return max(dict_entries, key=sort_key)
+
+def _extract_run_victory(run: JsonDict) -> bool:
+    for key in ("victory", "win", "is_victory"):
+        if run.get(key) is True:
+            return True
+    return False
+
+
+def _run_identity(run: JsonDict) -> str:
+    for key in ("run_id", "id", "start_time"):
+        value = run.get(key)
+        if value is not None:
+            return str(value)
+    path = run.get("_path")
+    if path is not None:
+        return str(path)
+    payload = json.dumps(run, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _history_run_paths(save_root: str) -> list[str]:
+    root = os.path.expanduser(save_root)
+    matches: list[tuple[float, str]] = []
+    for dirpath, _, filenames in os.walk(root):
+        normalized = dirpath.replace(os.sep, "/").lower()
+        if "/saves/history" not in normalized and not normalized.endswith("/history"):
+            continue
+        for filename in filenames:
+            if not filename.endswith(".run"):
+                continue
+            path = os.path.join(dirpath, filename)
+            try:
+                matches.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+    matches.sort(reverse=True)
+    return [path for _, path in matches]
+
+
+def read_latest_history_run(save_root: str) -> JsonDict:
+    for path in _history_run_paths(save_root):
+        try:
+            data = _load_json_file(path)
+        except json.JSONDecodeError:
+            continue
+        if data:
+            data["_path"] = path
+            data["_mtime"] = os.path.getmtime(path)
+            return data
+    raise FileNotFoundError(
+        f"No .run history file found under {os.path.expanduser(save_root)}"
+    )
+
+
+def _advance_seed_index(progress: JsonDict, run_setup: RunSetup) -> None:
+    if not run_setup.seed_set:
+        return
+    current = progress.get("current_seed_index")
+    if not isinstance(current, int) or current < 0:
+        current = 0
+    progress["current_seed_index"] = (current + 1) % len(run_setup.seed_set)
 
 
 def maybe_update_progress_after_state(
     client: Sts2Client, state: JsonDict, run_setup: RunSetup
 ) -> JsonDict | None:
+    del client
     if (
         not run_setup.increment_ascension_on_win
         or state.get("state_type") != "game_over"
     ):
         return None
 
-    compendium = client.get_compendium()
-    latest = _latest_history_entry(compendium)
-    if latest is None:
+    try:
+        latest = read_latest_history_run(run_setup.save_root)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
-    run_id = latest.get("run_id") or latest.get("id")
-    if not run_id or latest.get("win") is not True:
-        return None
-
+    run_id = _run_identity(latest)
     progress = _load_json_file(run_setup.progress_file)
-    if progress.get("last_processed_win_run_id") == run_id:
+    if progress.get("last_processed_history_run_id") == run_id:
         return None
+
+    victory = _extract_run_victory(latest)
+    completed_ascension = _extract_run_ascension(latest)
+    completed_seed = _extract_run_seed(latest)
 
     current_ascension = progress.get("ascension")
     if not isinstance(current_ascension, int):
@@ -1123,19 +1330,56 @@ def maybe_update_progress_after_state(
             run_setup.ascension if run_setup.ascension is not None else 0
         )
 
-    progress["ascension"] = current_ascension + 1
-    progress["last_processed_win_run_id"] = run_id
-    progress["last_win_seed"] = latest.get("seed")
-    progress["last_win_run_id"] = run_id
+    next_ascension = current_ascension
+    previous_seed_index = progress.get("current_seed_index", 0)
+    consecutive_a10 = progress.get("consecutive_a10_wins")
+    if not isinstance(consecutive_a10, int):
+        consecutive_a10 = 0
+
+    if victory:
+        won_at_max = (
+            completed_ascension == run_setup.max_ascension
+            or current_ascension >= run_setup.max_ascension
+        )
+        if won_at_max:
+            consecutive_a10 += 1
+            _advance_seed_index(progress, run_setup)
+        else:
+            consecutive_a10 = 0
+            next_ascension = min(current_ascension + 1, run_setup.max_ascension)
+            if run_setup.seed_policy in {"fixed_list", "fixed_list_until_win"}:
+                _advance_seed_index(progress, run_setup)
+    else:
+        consecutive_a10 = 0
+        if run_setup.seed_policy == "fixed_list":
+            _advance_seed_index(progress, run_setup)
+
+    progress["ascension"] = next_ascension
+    progress["consecutive_a10_wins"] = consecutive_a10
+    progress["last_processed_history_run_id"] = run_id
+    progress["last_processed_history_path"] = latest.get("_path")
+    progress["last_completed_seed"] = completed_seed
+    progress["last_completed_ascension"] = completed_ascension
+    progress["last_completed_victory"] = victory
+    if consecutive_a10 >= run_setup.stop_after_consecutive_a10_wins:
+        progress["stopped"] = True
+        progress["stop_reason"] = (
+            f"{consecutive_a10} consecutive A{run_setup.max_ascension} wins"
+        )
     _write_json_file(run_setup.progress_file, progress)
 
     return {
         "status": "updated",
-        "reason": "win_detected",
+        "reason": "completed_run_detected",
         "run_id": run_id,
-        "seed": latest.get("seed"),
+        "seed": completed_seed,
+        "victory": victory,
         "previous_ascension": current_ascension,
-        "next_ascension": progress["ascension"],
+        "next_ascension": next_ascension,
+        "previous_seed_index": previous_seed_index,
+        "next_seed_index": progress.get("current_seed_index", previous_seed_index),
+        "consecutive_a10_wins": consecutive_a10,
+        "stopped": progress.get("stopped", False),
         "progress_file": run_setup.progress_file,
     }
 
@@ -1221,6 +1465,377 @@ def verify_started_run_setup(
             time.sleep(0.25)
 
 
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _logging_enabled(config: HarnessConfig) -> bool:
+    return (
+        config.logging.official_run_logging
+        and bool(config.logging.sqlite_path)
+        and bool(config.agent.agent_name)
+        and bool(config.agent.model_name)
+        and bool(config.agent.condition_name)
+        and bool(config.run_setup.seed)
+        and config.run_setup.ascension is not None
+    )
+
+
+def _connect_log_db(config: HarnessConfig) -> sqlite3.Connection | None:
+    if not _logging_enabled(config) or config.logging.sqlite_path is None:
+        return None
+    path = os.path.expanduser(config.logging.sqlite_path)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(path)
+    _init_log_db(conn)
+    return conn
+
+
+def _init_log_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+          run_id TEXT PRIMARY KEY,
+          agent_name TEXT NOT NULL,
+          model_name TEXT NOT NULL,
+          condition_name TEXT NOT NULL,
+          seed TEXT NOT NULL,
+          ascension INTEGER,
+          start_time TEXT NOT NULL,
+          end_time TEXT,
+          final_floor INTEGER,
+          act INTEGER,
+          boss_reached INTEGER,
+          victory INTEGER,
+          death_reason TEXT,
+          character TEXT,
+          game_mode TEXT,
+          custom_settings TEXT,
+          harness_version TEXT,
+          prompt_version TEXT,
+          memory_version TEXT,
+          memory_checksum TEXT,
+          git_commit TEXT,
+          total_model_calls INTEGER,
+          total_input_tokens INTEGER,
+          total_output_tokens INTEGER,
+          total_tool_calls INTEGER,
+          invalid_action_count INTEGER DEFAULT 0,
+          harness_observations INTEGER DEFAULT 0,
+          agent_actions INTEGER DEFAULT 0,
+          auto_actions INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS steps (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          step_index INTEGER NOT NULL,
+          floor INTEGER,
+          room_type TEXT,
+          state_type TEXT,
+          hp INTEGER,
+          max_hp INTEGER,
+          gold INTEGER,
+          deck_size INTEGER,
+          relic_count INTEGER,
+          potion_count INTEGER,
+          legal_actions TEXT,
+          action_chosen TEXT,
+          action_source TEXT NOT NULL,
+          observation_hash TEXT,
+          prompt_hash TEXT,
+          response_hash TEXT,
+          tool_calls TEXT,
+          timestamp TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS run_summaries (
+          run_id TEXT PRIMARY KEY,
+          agent_summary TEXT,
+          harness_summary TEXT,
+          final_memory_diff TEXT,
+          notable_mistakes TEXT,
+          notable_successes TEXT,
+          timestamp TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+
+
+def _run_id(config: HarnessConfig, verification: JsonDict | None = None) -> str:
+    seed = config.run_setup.seed or "unknown_seed"
+    ascension = config.run_setup.ascension
+    start_time = None
+    if verification:
+        actual = verification.get("actual")
+        if isinstance(actual, dict):
+            start_time = actual.get("start_time")
+    if start_time is None:
+        start_time = int(time.time())
+    parts = [
+        config.agent.agent_name or "agent",
+        config.agent.condition_name or "condition",
+        seed,
+        f"a{ascension if ascension is not None else 'x'}",
+        str(start_time),
+    ]
+    return ":".join(_slug(part) for part in parts)
+
+
+def _state_floor(state: JsonDict) -> int | None:
+    for source in (state, _player(state)):
+        for key in ("floor", "floor_num", "floorNum"):
+            value = source.get(key)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _state_act(state: JsonDict) -> int | None:
+    for key in ("act", "act_num", "actNum"):
+        value = state.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _state_room_type(state: JsonDict) -> str | None:
+    value = state.get("room_type") or state.get("room")
+    if value is None:
+        map_state = state.get("map")
+        if isinstance(map_state, dict):
+            value = map_state.get("current_room_type")
+    return str(value) if value is not None else None
+
+
+def _deck_size(state: JsonDict) -> int | None:
+    player = _player(state)
+    for key in ("deck_size", "master_deck_size"):
+        value = player.get(key)
+        if isinstance(value, int):
+            return value
+    deck = player.get("deck") or player.get("master_deck")
+    return len(deck) if isinstance(deck, list) else None
+
+
+def _state_counts(state: JsonDict) -> tuple[int | None, int | None]:
+    player = _player(state)
+    relics = player.get("relics")
+    potions = player.get("potions")
+    return (
+        len(relics) if isinstance(relics, list) else None,
+        len(potions) if isinstance(potions, list) else None,
+    )
+
+
+def _progress_current_run_id(config: HarnessConfig) -> str | None:
+    progress = _load_json_file(config.run_setup.progress_file)
+    value = progress.get("current_run_id")
+    return str(value) if value else None
+
+
+def _set_progress_current_run_id(config: HarnessConfig, run_id: str) -> None:
+    progress = _load_json_file(config.run_setup.progress_file)
+    progress["current_run_id"] = run_id
+    _write_json_file(config.run_setup.progress_file, progress)
+
+
+def start_logged_run(
+    config: HarnessConfig, state: JsonDict, verification: JsonDict | None
+) -> JsonDict | None:
+    conn = _connect_log_db(config)
+    if conn is None:
+        return None
+    run_id = _run_id(config, verification)
+    player = _player(state)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO runs (
+          run_id, agent_name, model_name, condition_name, seed, ascension,
+          start_time, character, game_mode, custom_settings, harness_version,
+          prompt_version, memory_version, memory_checksum, git_commit
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            config.agent.agent_name,
+            config.agent.model_name,
+            config.agent.condition_name,
+            config.run_setup.seed,
+            config.run_setup.ascension,
+            _now_utc(),
+            config.run_setup.character
+            or player.get("character_id")
+            or player.get("character"),
+            state.get("game_mode"),
+            json.dumps({"run_setup_verification": verification}, sort_keys=True),
+            config.logging.harness_version,
+            config.agent.prompt_version,
+            config.agent.memory_version,
+            config.agent.memory_checksum,
+            config.logging.git_commit,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    _set_progress_current_run_id(config, run_id)
+    return {"status": "started", "run_id": run_id}
+
+
+def log_step(
+    config: HarnessConfig,
+    state: JsonDict,
+    actions: list[Action],
+    action: Action,
+    *,
+    action_source: str,
+) -> None:
+    conn = _connect_log_db(config)
+    run_id = _progress_current_run_id(config)
+    if conn is None or run_id is None:
+        if conn is not None:
+            conn.close()
+        return
+    row = conn.execute(
+        "SELECT COALESCE(MAX(step_index), -1) + 1 FROM steps WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    step_index = int(row[0])
+    player = _player(state)
+    relic_count, potion_count = _state_counts(state)
+    legal_actions = action_dicts(actions)
+    observation_json = json.dumps(
+        {"state": state, "actions": legal_actions}, sort_keys=True, default=str
+    )
+    conn.execute(
+        """
+        INSERT INTO steps (
+          run_id, step_index, floor, room_type, state_type, hp, max_hp, gold,
+          deck_size, relic_count, potion_count, legal_actions, action_chosen,
+          action_source, observation_hash, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            step_index,
+            _state_floor(state),
+            _state_room_type(state),
+            state.get("state_type"),
+            player.get("hp"),
+            player.get("max_hp"),
+            player.get("gold"),
+            _deck_size(state),
+            relic_count,
+            potion_count,
+            json.dumps(legal_actions, sort_keys=True),
+            json.dumps(action.as_dict(), sort_keys=True),
+            action_source,
+            hashlib.sha256(observation_json.encode("utf-8")).hexdigest(),
+            _now_utc(),
+        ),
+    )
+    count_column = "auto_actions" if action_source == "auto" else "agent_actions"
+    conn.execute(
+        f"""
+        UPDATE runs
+        SET harness_observations = COALESCE(harness_observations, 0) + 1,
+            {count_column} = COALESCE({count_column}, 0) + 1
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def finalize_logged_run(config: HarnessConfig, state: JsonDict) -> None:
+    conn = _connect_log_db(config)
+    run_id = _progress_current_run_id(config)
+    if conn is None or run_id is None or state.get("state_type") != "game_over":
+        if conn is not None:
+            conn.close()
+        return
+    try:
+        history = read_latest_history_run(config.run_setup.save_root)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        history = {}
+    victory = _extract_run_victory(history)
+    floor = _state_floor(state)
+    if floor is None:
+        floor = _extract_int(history, "floor", "floor_num", "floor_reached")
+    conn.execute(
+        """
+        UPDATE runs
+        SET end_time = ?, final_floor = ?, act = ?, boss_reached = ?,
+            victory = ?, death_reason = ?
+        WHERE run_id = ?
+        """,
+        (
+            _now_utc(),
+            floor,
+            _state_act(state) or _extract_int(history, "act", "act_num"),
+            1 if bool(history.get("boss_reached")) else 0,
+            1 if victory else 0,
+            history.get("death_reason") or state.get("death_reason"),
+            run_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _extract_int(value: JsonDict, *keys: str) -> int | None:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, int):
+            return item
+    return None
+
+
+def auto_action_for_state(state: JsonDict, actions: list[Action]) -> Action | None:
+    if not actions or state.get("state_type") == "game_over":
+        return None
+    if len(actions) != 1:
+        return None
+    action = actions[0]
+    if action.id in {
+        "proceed_to_map",
+        "event_advance_dialogue",
+        "crystal_sphere_proceed",
+    }:
+        return action
+    if action.category == "map":
+        return action
+    return None
+
+
+def resolve_auto_actions(
+    client: Sts2Client,
+    state: JsonDict,
+    config: HarnessConfig,
+    *,
+    wait: float = 0.5,
+) -> tuple[JsonDict, list[JsonDict]]:
+    if not config.auto_resolve:
+        return state, []
+    auto_actions: list[JsonDict] = []
+    for _ in range(max(0, config.max_auto_actions)):
+        actions = build_actions(state, config.run_setup)
+        action = auto_action_for_state(state, actions)
+        if action is None:
+            break
+        result = client.post_action(action.request)
+        log_step(config, state, actions, action, action_source="auto")
+        auto_actions.append(
+            {"action": action.as_dict(actions.index(action)), "result": result}
+        )
+        if wait > 0:
+            time.sleep(wait)
+        state = _wait_for_play_phase(client)
+    return state, auto_actions
+
+
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False))
 
@@ -1237,32 +1852,49 @@ def command_state(args: argparse.Namespace) -> int:
 
 def command_actions(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
-    run_setup = load_run_setup(args.config)
+    config = load_harness_config(args.config)
     state = _wait_for_play_phase(client)
-    actions = action_dicts(build_actions(state, run_setup))
-    print_json({"state_type": state.get("state_type"), "actions": actions})
+    state, auto_actions = resolve_auto_actions(client, state, config)
+    actions = action_dicts(build_actions(state, config.run_setup))
+    output: JsonDict = {"state_type": state.get("state_type"), "actions": actions}
+    if auto_actions:
+        output["auto_actions"] = auto_actions
+    print_json(output)
     return 0
 
 
 def command_snapshot(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
-    run_setup = load_run_setup(args.config)
+    config = load_harness_config(args.config)
     state = _wait_for_play_phase(client)
-    actions = action_dicts(build_actions(state, run_setup))
+    state, auto_actions = resolve_auto_actions(client, state, config)
+    actions = action_dicts(build_actions(state, config.run_setup))
     output: JsonDict = {"state": state, "actions": actions}
-    progress_update = maybe_update_progress_after_state(client, state, run_setup)
+    if auto_actions:
+        output["auto_actions"] = auto_actions
+        progress_update = maybe_update_progress_after_state(
+            client, state, config.run_setup
+        )
     if progress_update is not None:
         output["progress_update"] = progress_update
+    finalize_logged_run(config, state)
     print_json(output)
     return 0
 
 
 def command_act(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
-    run_setup = load_run_setup(args.config)
+    config = load_harness_config(args.config)
     before = _wait_for_play_phase(client)
-    actions = build_actions(before, run_setup)
+    before, pre_auto_actions = resolve_auto_actions(client, before, config)
+    actions = build_actions(before, config.run_setup)
     action = find_action(actions, args.action)
+    start_action = (
+        action.request.get("action") == "menu_select"
+        and str(action.request.get("option") or "").lower() in {"confirm", "embark"}
+    )
+    if not start_action:
+        log_step(config, before, actions, action, action_source="agent")
     try:
         result = client.post_action(action.request)
     except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
@@ -1270,6 +1902,7 @@ def command_act(args: argparse.Namespace) -> int:
             raise
 
         output: JsonDict = {
+            "pre_auto_actions": pre_auto_actions,
             "action": action.as_dict(actions.index(action)),
             "result": {
                 "status": "timeout_uncertain",
@@ -1285,38 +1918,59 @@ def command_act(args: argparse.Namespace) -> int:
                 time.sleep(args.wait)
             try:
                 after = _wait_for_play_phase(client)
+                after, post_auto_actions = resolve_auto_actions(client, after, config)
                 output["state"] = after
-                output["actions"] = action_dicts(build_actions(after, run_setup))
+                output["actions"] = action_dicts(build_actions(after, config.run_setup))
+                if post_auto_actions:
+                    output["auto_actions"] = post_auto_actions
                 progress_update = maybe_update_progress_after_state(
-                    client, after, run_setup
+                    client, after, config.run_setup
                 )
                 if progress_update is not None:
                     output["progress_update"] = progress_update
-                verification = verify_started_run_setup(action, run_setup)
+                finalize_logged_run(config, after)
+                verification = verify_started_run_setup(action, config.run_setup)
                 if verification is not None:
                     output["run_setup_verification"] = verification
+                    log_start = start_logged_run(config, after, verification)
+                    if log_start is not None:
+                        output["run_log"] = log_start
+                        log_step(
+                            config, before, actions, action, action_source="agent"
+                        )
             except Exception as followup_exc:
                 output["followup_error"] = str(followup_exc)
         print_json(output)
         return 0
 
     output: JsonDict = {
+        "pre_auto_actions": pre_auto_actions,
         "action": action.as_dict(actions.index(action)),
         "result": result,
     }
+    if not pre_auto_actions:
+        output.pop("pre_auto_actions")
 
     if not args.no_after:
         if args.wait > 0:
             time.sleep(args.wait)
         after = _wait_for_play_phase(client)
+        after, post_auto_actions = resolve_auto_actions(client, after, config)
         output["state"] = after
-        output["actions"] = action_dicts(build_actions(after, run_setup))
-        progress_update = maybe_update_progress_after_state(client, after, run_setup)
+        output["actions"] = action_dicts(build_actions(after, config.run_setup))
+        if post_auto_actions:
+            output["auto_actions"] = post_auto_actions
+        progress_update = maybe_update_progress_after_state(client, after, config.run_setup)
         if progress_update is not None:
             output["progress_update"] = progress_update
-        verification = verify_started_run_setup(action, run_setup)
+        finalize_logged_run(config, after)
+        verification = verify_started_run_setup(action, config.run_setup)
         if verification is not None:
             output["run_setup_verification"] = verification
+            log_start = start_logged_run(config, after, verification)
+            if log_start is not None:
+                output["run_log"] = log_start
+                log_step(config, before, actions, action, action_source="agent")
 
     print_json(output)
     status = result.get("status")

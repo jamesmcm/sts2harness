@@ -44,8 +44,11 @@ optional character selection harness policy rather than agent input:
 ```json
 {
   "run_setup": {
+    "seed_policy": "fixed_until_win",
     "seed": "ABC123",
     "ascension": 0,
+    "max_ascension": 10,
+    "stop_after_consecutive_a10_wins": 3,
     "character": "IRONCLAD",
     "progress_file": ".sts2harness-progress.json",
     "save_root": "~/.local/share/SlayTheSpire2/steam",
@@ -59,8 +62,13 @@ the configured `seed` and current persisted `ascension` to the STS2MCP request.
 After that run-start action, `act` reads the newest `current_run.save` under
 `save_root` and emits `run_setup_verification` showing expected vs actual
 `seed`, `ascension`, `game_mode`, and save path.
-After a `game_over` state, the harness checks Compendium run history; if the
-latest run is a win, it increments ascension once in `progress_file`.
+After a `game_over` state, the harness reads the newest completed `.run` file
+under `save_root` history saves and updates `progress_file` once for that run.
+Wins increment ascension up to A10. A10 wins advance the seed when using a seed
+set and stop the experiment after three consecutive A10 wins by default.
+
+For official experiment setup, protected config, seed policies, SQLite logging,
+and auto-resolve behavior, see [USER_GUIDE.md](USER_GUIDE.md).
 
 Use another config path with:
 

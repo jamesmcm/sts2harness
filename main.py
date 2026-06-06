@@ -5,7 +5,6 @@ import fcntl
 import json
 import os
 import socket
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -193,7 +192,9 @@ def load_run_setup(config_path: str) -> RunSetup:
     setup = RunSetup(
         seed=str(seed).strip() if seed is not None and str(seed).strip() else None,
         ascension=_optional_int(run_config.get("ascension")),
-        character=str(character).strip().upper() if character is not None and str(character).strip() else None,
+        character=str(character).strip().upper()
+        if character is not None and str(character).strip()
+        else None,
         progress_file=progress_file,
         save_root=save_root,
         increment_ascension_on_win=bool(increment_on_win),
@@ -203,13 +204,26 @@ def load_run_setup(config_path: str) -> RunSetup:
     env_ascension = os.environ.get("STS2HARNESS_ASCENSION")
     env_character = os.environ.get("STS2HARNESS_CHARACTER")
     env_save_root = os.environ.get("STS2HARNESS_SAVE_ROOT")
-    if env_seed is not None or env_ascension is not None or env_character is not None or env_save_root is not None:
+    if (
+        env_seed is not None
+        or env_ascension is not None
+        or env_character is not None
+        or env_save_root is not None
+    ):
         setup = RunSetup(
-            seed=env_seed.strip() if env_seed is not None and env_seed.strip() else setup.seed,
-            ascension=_optional_int(env_ascension) if env_ascension is not None else setup.ascension,
-            character=env_character.strip().upper() if env_character is not None and env_character.strip() else setup.character,
+            seed=env_seed.strip()
+            if env_seed is not None and env_seed.strip()
+            else setup.seed,
+            ascension=_optional_int(env_ascension)
+            if env_ascension is not None
+            else setup.ascension,
+            character=env_character.strip().upper()
+            if env_character is not None and env_character.strip()
+            else setup.character,
             progress_file=setup.progress_file,
-            save_root=env_save_root.strip() if env_save_root is not None and env_save_root.strip() else setup.save_root,
+            save_root=env_save_root.strip()
+            if env_save_root is not None and env_save_root.strip()
+            else setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
         )
 
@@ -351,7 +365,9 @@ def _menu_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Ac
         return actions
     menu_screen = str(state.get("menu_screen") or "")
     selected_character = state.get("selected_character")
-    has_selected_character = isinstance(selected_character, dict) and bool(selected_character.get("id"))
+    has_selected_character = isinstance(selected_character, dict) and bool(
+        selected_character.get("id")
+    )
     for option in options:
         if isinstance(option, str):
             name = option
@@ -384,7 +400,11 @@ def _menu_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Ac
 
         request: JsonDict = {"action": "menu_select", "option": name}
         notes: list[str] = []
-        if run_setup is not None and menu_screen == "custom_run" and name.lower() in {"confirm", "embark"}:
+        if (
+            run_setup is not None
+            and menu_screen == "custom_run"
+            and name.lower() in {"confirm", "embark"}
+        ):
             if run_setup.seed:
                 request["seed"] = run_setup.seed
                 notes.append("seed supplied by harness config")
@@ -614,7 +634,9 @@ def _fake_merchant_actions(state: JsonDict) -> list[Action]:
     fake = state.get("fake_merchant")
     if not isinstance(fake, dict):
         return []
-    actions = _shop_actions({"state_type": "shop", "shop": fake.get("shop"), "player": state.get("player")})
+    actions = _shop_actions(
+        {"state_type": "shop", "shop": fake.get("shop"), "player": state.get("player")}
+    )
     shop = fake.get("shop")
     if isinstance(shop, dict) and shop.get("can_proceed") is True:
         actions.append(
@@ -1065,13 +1087,21 @@ def _latest_history_entry(compendium: JsonDict) -> JsonDict | None:
         return None
 
     def sort_key(entry: JsonDict) -> tuple[str, str]:
-        return (str(entry.get("last_write_time_utc") or ""), str(entry.get("start_time") or entry.get("id") or ""))
+        return (
+            str(entry.get("last_write_time_utc") or ""),
+            str(entry.get("start_time") or entry.get("id") or ""),
+        )
 
     return max(dict_entries, key=sort_key)
 
 
-def maybe_update_progress_after_state(client: Sts2Client, state: JsonDict, run_setup: RunSetup) -> JsonDict | None:
-    if not run_setup.increment_ascension_on_win or state.get("state_type") != "game_over":
+def maybe_update_progress_after_state(
+    client: Sts2Client, state: JsonDict, run_setup: RunSetup
+) -> JsonDict | None:
+    if (
+        not run_setup.increment_ascension_on_win
+        or state.get("state_type") != "game_over"
+    ):
         return None
 
     compendium = client.get_compendium()
@@ -1089,7 +1119,9 @@ def maybe_update_progress_after_state(client: Sts2Client, state: JsonDict, run_s
 
     current_ascension = progress.get("ascension")
     if not isinstance(current_ascension, int):
-        current_ascension = run_setup.ascension if run_setup.ascension is not None else 0
+        current_ascension = (
+            run_setup.ascension if run_setup.ascension is not None else 0
+        )
 
     progress["ascension"] = current_ascension + 1
     progress["last_processed_win_run_id"] = run_id
@@ -1132,12 +1164,18 @@ def read_latest_current_run(save_root: str) -> JsonDict:
         if data:
             data["_path"] = path
             return data
-    raise FileNotFoundError(f"No current_run.save found under {os.path.expanduser(save_root)}")
+    raise FileNotFoundError(
+        f"No current_run.save found under {os.path.expanduser(save_root)}"
+    )
 
 
-def verify_started_run_setup(action: Action, run_setup: RunSetup, *, timeout: float = 5.0) -> JsonDict | None:
+def verify_started_run_setup(
+    action: Action, run_setup: RunSetup, *, timeout: float = 5.0
+) -> JsonDict | None:
     request = action.request
-    if request.get("action") != "menu_select" or str(request.get("option") or "").lower() not in {"confirm", "embark"}:
+    if request.get("action") != "menu_select" or str(
+        request.get("option") or ""
+    ).lower() not in {"confirm", "embark"}:
         return None
     if "seed" not in request and "ascension" not in request:
         return None
@@ -1154,7 +1192,9 @@ def verify_started_run_setup(action: Action, run_setup: RunSetup, *, timeout: fl
             expected_seed = request.get("seed")
             expected_ascension = request.get("ascension")
             seed_ok = expected_seed is None or str(actual_seed) == str(expected_seed)
-            ascension_ok = expected_ascension is None or actual_ascension == expected_ascension
+            ascension_ok = (
+                expected_ascension is None or actual_ascension == expected_ascension
+            )
 
             return {
                 "status": "ok" if seed_ok and ascension_ok else "mismatch",
@@ -1247,7 +1287,9 @@ def command_act(args: argparse.Namespace) -> int:
                 after = _wait_for_play_phase(client)
                 output["state"] = after
                 output["actions"] = action_dicts(build_actions(after, run_setup))
-                progress_update = maybe_update_progress_after_state(client, after, run_setup)
+                progress_update = maybe_update_progress_after_state(
+                    client, after, run_setup
+                )
                 if progress_update is not None:
                     output["progress_update"] = progress_update
                 verification = verify_started_run_setup(action, run_setup)
@@ -1357,7 +1399,9 @@ def main(argv: list[str] | None = None) -> int:
             print_json({"status": "timeout", "error": "Timed out waiting for STS2MCP"})
         else:
             reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-            print_json({"status": "error", "error": f"Could not reach STS2MCP: {reason}"})
+            print_json(
+                {"status": "error", "error": f"Could not reach STS2MCP: {reason}"}
+            )
         return 1
     except (ValueError, KeyError, TypeError) as exc:
         print_json({"status": "error", "error": str(exc)})

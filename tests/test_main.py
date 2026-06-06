@@ -71,7 +71,12 @@ class RunSetupActionTests(unittest.TestCase):
         self.assertEqual(actions[0].id, "menu:confirm")
         self.assertEqual(
             actions[0].request,
-            {"action": "menu_select", "option": "confirm", "seed": "ABC123", "ascension": 4},
+            {
+                "action": "menu_select",
+                "option": "confirm",
+                "seed": "ABC123",
+                "ascension": 4,
+            },
         )
 
     def test_configured_character_filters_custom_run_character_choices(self):
@@ -88,7 +93,9 @@ class RunSetupActionTests(unittest.TestCase):
 
         actions = main.build_actions(state, setup)
 
-        self.assertEqual([action.id for action in actions], ["menu:silent", "menu:back"])
+        self.assertEqual(
+            [action.id for action in actions], ["menu:silent", "menu:back"]
+        )
 
     def test_seeded_setup_filters_singleplayer_to_custom(self):
         state = {
@@ -105,14 +112,18 @@ class RunSetupActionTests(unittest.TestCase):
 
         actions = main.build_actions(state, setup)
 
-        self.assertEqual([action.id for action in actions], ["menu:custom", "menu:back"])
+        self.assertEqual(
+            [action.id for action in actions], ["menu:custom", "menu:back"]
+        )
 
 
 class ProgressTests(unittest.TestCase):
     def test_win_increments_ascension_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             progress_file = str(Path(tmpdir) / "progress.json")
-            setup = main.RunSetup(seed="ABC123", ascension=1, progress_file=progress_file)
+            setup = main.RunSetup(
+                seed="ABC123", ascension=1, progress_file=progress_file
+            )
             client = FakeCompendiumClient(
                 {
                     "sections": {
@@ -130,8 +141,12 @@ class ProgressTests(unittest.TestCase):
                 }
             )
 
-            first = main.maybe_update_progress_after_state(client, {"state_type": "game_over"}, setup)
-            second = main.maybe_update_progress_after_state(client, {"state_type": "game_over"}, setup)
+            first = main.maybe_update_progress_after_state(
+                client, {"state_type": "game_over"}, setup
+            )
+            second = main.maybe_update_progress_after_state(
+                client, {"state_type": "game_over"}, setup
+            )
 
             self.assertEqual(first["next_ascension"], 2)
             self.assertIsNone(second)
@@ -152,7 +167,14 @@ class CurrentRunVerificationTests(unittest.TestCase):
             )
             fresh_file = fresh / "current_run.save"
             fresh_file.write_text(
-                json.dumps({"rng": {"seed": "ABC123"}, "ascension": 4, "game_mode": "custom", "start_time": 2}),
+                json.dumps(
+                    {
+                        "rng": {"seed": "ABC123"},
+                        "ascension": 4,
+                        "game_mode": "custom",
+                        "start_time": 2,
+                    }
+                ),
                 encoding="utf-8",
             )
             os.utime(stale / "current_run.save", (1000, 1000))
@@ -162,7 +184,12 @@ class CurrentRunVerificationTests(unittest.TestCase):
                 id="menu:confirm",
                 label="Select menu option: confirm",
                 category="menu",
-                request={"action": "menu_select", "option": "confirm", "seed": "ABC123", "ascension": 4},
+                request={
+                    "action": "menu_select",
+                    "option": "confirm",
+                    "seed": "ABC123",
+                    "ascension": 4,
+                },
             )
             setup = main.RunSetup(save_root=tmpdir)
 

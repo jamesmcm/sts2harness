@@ -17,9 +17,20 @@ from typing import Any
 DEFAULT_BASE_URL = "http://localhost:15526"
 DEFAULT_MCP_DELAY = 1.0
 DEFAULT_THROTTLE_FILE = "/tmp/sts2harness-mcp-throttle"
+DEFAULT_CONFIG_FILE = "sts2harness.json"
+DEFAULT_PROGRESS_FILE = ".sts2harness-progress.json"
 
 
 JsonDict = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RunSetup:
+    seed: str | None = None
+    ascension: int | None = None
+    character: str | None = None
+    progress_file: str = DEFAULT_PROGRESS_FILE
+    increment_ascension_on_win: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,13 @@ class Sts2Client:
             body = response.read().decode("utf-8")
         return json.loads(body)
 
+    def get_compendium(self) -> JsonDict:
+        self._wait_for_request_slot()
+        url = f"{self.base_url}/api/v1/compendium"
+        with urllib.request.urlopen(url, timeout=self.timeout) as response:
+            body = response.read().decode("utf-8")
+        return json.loads(body)
+
 
 def _is_timeout(exc: BaseException) -> bool:
     if isinstance(exc, (TimeoutError, socket.timeout)):
@@ -126,6 +144,84 @@ def _name(value: JsonDict, *keys: str, fallback: str = "unknown") -> str:
         if item is not None and str(item):
             return str(item)
     return fallback
+
+
+def _load_json_file(path: str) -> JsonDict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except FileNotFoundError:
+        return {}
+
+
+def _write_json_file(path: str, value: JsonDict) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid integer setting")
+    return int(value)
+
+
+def load_run_setup(config_path: str) -> RunSetup:
+    config = _load_json_file(config_path)
+    run_config = config.get("run_setup")
+    if not isinstance(run_config, dict):
+        run_config = config
+
+    seed = run_config.get("seed")
+    character = run_config.get("character")
+    progress_file = str(run_config.get("progress_file") or DEFAULT_PROGRESS_FILE)
+    increment_on_win = run_config.get("increment_ascension_on_win")
+    if increment_on_win is None:
+        increment_on_win = True
+
+    setup = RunSetup(
+        seed=str(seed).strip() if seed is not None and str(seed).strip() else None,
+        ascension=_optional_int(run_config.get("ascension")),
+        character=str(character).strip().upper() if character is not None and str(character).strip() else None,
+        progress_file=progress_file,
+        increment_ascension_on_win=bool(increment_on_win),
+    )
+
+    env_seed = os.environ.get("STS2HARNESS_SEED")
+    env_ascension = os.environ.get("STS2HARNESS_ASCENSION")
+    env_character = os.environ.get("STS2HARNESS_CHARACTER")
+    if env_seed is not None or env_ascension is not None or env_character is not None:
+        setup = RunSetup(
+            seed=env_seed.strip() if env_seed is not None and env_seed.strip() else setup.seed,
+            ascension=_optional_int(env_ascension) if env_ascension is not None else setup.ascension,
+            character=env_character.strip().upper() if env_character is not None and env_character.strip() else setup.character,
+            progress_file=setup.progress_file,
+            increment_ascension_on_win=setup.increment_ascension_on_win,
+        )
+
+    progress = _load_json_file(setup.progress_file)
+    current_ascension = progress.get("ascension")
+    if isinstance(current_ascension, int):
+        setup = RunSetup(
+            seed=setup.seed,
+            ascension=current_ascension,
+            character=setup.character,
+            progress_file=setup.progress_file,
+            increment_ascension_on_win=setup.increment_ascension_on_win,
+        )
+    elif setup.ascension is not None:
+        progress["ascension"] = setup.ascension
+        _write_json_file(setup.progress_file, progress)
+
+    return setup
 
 
 def _slug(value: Any) -> str:
@@ -189,11 +285,11 @@ def _wait_for_play_phase(client: Sts2Client, *, poll_interval: float = 0.5) -> J
         time.sleep(poll_interval)
 
 
-def build_actions(state: JsonDict) -> list[Action]:
+def build_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Action]:
     state_type = str(state.get("state_type") or "unknown")
     actions: list[Action] = []
 
-    actions.extend(_menu_actions(state))
+    actions.extend(_menu_actions(state, run_setup))
     actions.extend(_global_potion_actions(state))
 
     if _combat_like(state_type):
@@ -239,13 +335,16 @@ def build_actions(state: JsonDict) -> list[Action]:
     return actions
 
 
-def _menu_actions(state: JsonDict) -> list[Action]:
+def _menu_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Action]:
     if state.get("state_type") != "menu":
         return []
     actions: list[Action] = []
     options = state.get("options")
     if not isinstance(options, list):
         return actions
+    menu_screen = str(state.get("menu_screen") or "")
+    selected_character = state.get("selected_character")
+    has_selected_character = isinstance(selected_character, dict) and bool(selected_character.get("id"))
     for option in options:
         if isinstance(option, str):
             name = option
@@ -257,12 +356,42 @@ def _menu_actions(state: JsonDict) -> list[Action]:
             continue
         if not name or not enabled:
             continue
+
+        if (
+            run_setup is not None
+            and menu_screen == "singleplayer"
+            and (run_setup.seed or run_setup.ascension is not None)
+            and name.lower() not in {"custom", "back"}
+        ):
+            continue
+
+        if (
+            run_setup is not None
+            and menu_screen == "custom_run"
+            and run_setup.character
+            and not has_selected_character
+            and name.upper() != run_setup.character
+            and name.lower() not in {"back", "unready"}
+        ):
+            continue
+
+        request: JsonDict = {"action": "menu_select", "option": name}
+        notes: list[str] = []
+        if run_setup is not None and menu_screen == "custom_run" and name.lower() in {"confirm", "embark"}:
+            if run_setup.seed:
+                request["seed"] = run_setup.seed
+                notes.append("seed supplied by harness config")
+            if run_setup.ascension is not None:
+                request["ascension"] = run_setup.ascension
+                notes.append("ascension supplied by harness config")
+
         actions.append(
             Action(
                 id=f"menu:{_slug(name)}",
                 label=f"Select menu option: {name}",
                 category="menu",
-                request={"action": "menu_select", "option": name},
+                request=request,
+                notes=tuple(notes),
             )
         )
     return actions
@@ -913,6 +1042,65 @@ def find_action(actions: list[Action], action_ref: str) -> Action:
     )
 
 
+def _latest_history_entry(compendium: JsonDict) -> JsonDict | None:
+    sections = compendium.get("sections")
+    if not isinstance(sections, dict):
+        return None
+    run_history = sections.get("run_history")
+    if not isinstance(run_history, dict):
+        return None
+    entries = run_history.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    dict_entries = [entry for entry in entries if isinstance(entry, dict)]
+    if not dict_entries:
+        return None
+
+    def sort_key(entry: JsonDict) -> tuple[str, str]:
+        return (str(entry.get("last_write_time_utc") or ""), str(entry.get("start_time") or entry.get("id") or ""))
+
+    return max(dict_entries, key=sort_key)
+
+
+def maybe_update_progress_after_state(client: Sts2Client, state: JsonDict, run_setup: RunSetup) -> JsonDict | None:
+    if not run_setup.increment_ascension_on_win or state.get("state_type") != "game_over":
+        return None
+
+    compendium = client.get_compendium()
+    latest = _latest_history_entry(compendium)
+    if latest is None:
+        return None
+
+    run_id = latest.get("run_id") or latest.get("id")
+    if not run_id or latest.get("win") is not True:
+        return None
+
+    progress = _load_json_file(run_setup.progress_file)
+    if progress.get("last_processed_win_run_id") == run_id:
+        return None
+
+    current_ascension = progress.get("ascension")
+    if not isinstance(current_ascension, int):
+        current_ascension = run_setup.ascension if run_setup.ascension is not None else 0
+
+    progress["ascension"] = current_ascension + 1
+    progress["last_processed_win_run_id"] = run_id
+    progress["last_win_seed"] = latest.get("seed")
+    progress["last_win_run_id"] = run_id
+    _write_json_file(run_setup.progress_file, progress)
+
+    return {
+        "status": "updated",
+        "reason": "win_detected",
+        "run_id": run_id,
+        "seed": latest.get("seed"),
+        "previous_ascension": current_ascension,
+        "next_ascension": progress["ascension"],
+        "progress_file": run_setup.progress_file,
+    }
+
+
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False))
 
@@ -929,24 +1117,31 @@ def command_state(args: argparse.Namespace) -> int:
 
 def command_actions(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
+    run_setup = load_run_setup(args.config)
     state = _wait_for_play_phase(client)
-    actions = action_dicts(build_actions(state))
+    actions = action_dicts(build_actions(state, run_setup))
     print_json({"state_type": state.get("state_type"), "actions": actions})
     return 0
 
 
 def command_snapshot(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
+    run_setup = load_run_setup(args.config)
     state = _wait_for_play_phase(client)
-    actions = action_dicts(build_actions(state))
-    print_json({"state": state, "actions": actions})
+    actions = action_dicts(build_actions(state, run_setup))
+    output: JsonDict = {"state": state, "actions": actions}
+    progress_update = maybe_update_progress_after_state(client, state, run_setup)
+    if progress_update is not None:
+        output["progress_update"] = progress_update
+    print_json(output)
     return 0
 
 
 def command_act(args: argparse.Namespace) -> int:
     client = Sts2Client(args.base_url, timeout=args.timeout, mcp_delay=args.mcp_delay)
+    run_setup = load_run_setup(args.config)
     before = _wait_for_play_phase(client)
-    actions = build_actions(before)
+    actions = build_actions(before, run_setup)
     action = find_action(actions, args.action)
     try:
         result = client.post_action(action.request)
@@ -971,7 +1166,10 @@ def command_act(args: argparse.Namespace) -> int:
             try:
                 after = _wait_for_play_phase(client)
                 output["state"] = after
-                output["actions"] = action_dicts(build_actions(after))
+                output["actions"] = action_dicts(build_actions(after, run_setup))
+                progress_update = maybe_update_progress_after_state(client, after, run_setup)
+                if progress_update is not None:
+                    output["progress_update"] = progress_update
             except Exception as followup_exc:
                 output["followup_error"] = str(followup_exc)
         print_json(output)
@@ -987,7 +1185,10 @@ def command_act(args: argparse.Namespace) -> int:
             time.sleep(args.wait)
         after = _wait_for_play_phase(client)
         output["state"] = after
-        output["actions"] = action_dicts(build_actions(after))
+        output["actions"] = action_dicts(build_actions(after, run_setup))
+        progress_update = maybe_update_progress_after_state(client, after, run_setup)
+        if progress_update is not None:
+            output["progress_update"] = progress_update
 
     print_json(output)
     status = result.get("status")
@@ -1000,6 +1201,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="State-scoped CLI harness for STS2MCP.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_FILE,
+        help="Harness-managed run setup config JSON.",
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument(
         "--mcp-delay",

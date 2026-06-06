@@ -36,6 +36,34 @@ Use a different mod URL if needed:
 uv run python main.py --base-url http://localhost:15526 actions
 ```
 
+## Harness-Managed Run Setup
+
+Create `sts2harness.json` in this directory to make seed, ascension, and
+optional character selection harness policy rather than agent input:
+
+```json
+{
+  "run_setup": {
+    "seed": "ABC123",
+    "ascension": 0,
+    "character": "IRONCLAD",
+    "progress_file": ".sts2harness-progress.json",
+    "increment_ascension_on_win": true
+  }
+}
+```
+
+On the custom-run setup screen, `confirm` / `embark` actions automatically add
+the configured `seed` and current persisted `ascension` to the STS2MCP request.
+After a `game_over` state, the harness checks Compendium run history; if the
+latest run is a win, it increments ascension once in `progress_file`.
+
+Use another config path with:
+
+```bash
+uv run python main.py --config path/to/sts2harness.json act 0
+```
+
 The default HTTP timeout is 30 seconds. Override it for diagnostics:
 
 ```bash

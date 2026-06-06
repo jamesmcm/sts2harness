@@ -1,4 +1,6 @@
 import unittest
+import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -135,6 +137,41 @@ class ProgressTests(unittest.TestCase):
             self.assertIsNone(second)
             progress = main._load_json_file(progress_file)
             self.assertEqual(progress["ascension"], 2)
+
+
+class CurrentRunVerificationTests(unittest.TestCase):
+    def test_verify_started_run_setup_reads_newest_current_run_save(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stale = Path(tmpdir) / "steamid" / "profile1" / "saves"
+            fresh = Path(tmpdir) / "steamid" / "modded" / "profile2" / "saves"
+            stale.mkdir(parents=True)
+            fresh.mkdir(parents=True)
+            (stale / "current_run.save").write_text(
+                json.dumps({"rng": {"seed": "OLD"}, "ascension": 0, "start_time": 1}),
+                encoding="utf-8",
+            )
+            fresh_file = fresh / "current_run.save"
+            fresh_file.write_text(
+                json.dumps({"rng": {"seed": "ABC123"}, "ascension": 4, "game_mode": "custom", "start_time": 2}),
+                encoding="utf-8",
+            )
+            os.utime(stale / "current_run.save", (1000, 1000))
+            os.utime(fresh_file, (2000, 2000))
+
+            action = main.Action(
+                id="menu:confirm",
+                label="Select menu option: confirm",
+                category="menu",
+                request={"action": "menu_select", "option": "confirm", "seed": "ABC123", "ascension": 4},
+            )
+            setup = main.RunSetup(save_root=tmpdir)
+
+            verification = main.verify_started_run_setup(action, setup, timeout=0)
+
+            self.assertEqual(verification["status"], "ok")
+            self.assertEqual(verification["actual"]["seed"], "ABC123")
+            self.assertEqual(verification["actual"]["ascension"], 4)
+            self.assertEqual(verification["actual"]["game_mode"], "custom")
 
 
 class FakeCompendiumClient:

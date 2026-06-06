@@ -48,6 +48,7 @@ optional character selection harness policy rather than agent input:
     "ascension": 0,
     "character": "IRONCLAD",
     "progress_file": ".sts2harness-progress.json",
+    "save_root": "~/.local/share/SlayTheSpire2/steam",
     "increment_ascension_on_win": true
   }
 }
@@ -55,6 +56,9 @@ optional character selection harness policy rather than agent input:
 
 On the custom-run setup screen, `confirm` / `embark` actions automatically add
 the configured `seed` and current persisted `ascension` to the STS2MCP request.
+After that run-start action, `act` reads the newest `current_run.save` under
+`save_root` and emits `run_setup_verification` showing expected vs actual
+`seed`, `ascension`, `game_mode`, and save path.
 After a `game_over` state, the harness checks Compendium run history; if the
 latest run is a win, it increments ascension once in `progress_file`.
 

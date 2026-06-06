@@ -19,6 +19,7 @@ DEFAULT_MCP_DELAY = 1.0
 DEFAULT_THROTTLE_FILE = "/tmp/sts2harness-mcp-throttle"
 DEFAULT_CONFIG_FILE = "sts2harness.json"
 DEFAULT_PROGRESS_FILE = ".sts2harness-progress.json"
+DEFAULT_SAVE_ROOT = "~/.local/share/SlayTheSpire2/steam"
 
 
 JsonDict = dict[str, Any]
@@ -30,6 +31,7 @@ class RunSetup:
     ascension: int | None = None
     character: str | None = None
     progress_file: str = DEFAULT_PROGRESS_FILE
+    save_root: str = DEFAULT_SAVE_ROOT
     increment_ascension_on_win: bool = True
 
 
@@ -183,6 +185,7 @@ def load_run_setup(config_path: str) -> RunSetup:
     seed = run_config.get("seed")
     character = run_config.get("character")
     progress_file = str(run_config.get("progress_file") or DEFAULT_PROGRESS_FILE)
+    save_root = str(run_config.get("save_root") or DEFAULT_SAVE_ROOT)
     increment_on_win = run_config.get("increment_ascension_on_win")
     if increment_on_win is None:
         increment_on_win = True
@@ -192,18 +195,21 @@ def load_run_setup(config_path: str) -> RunSetup:
         ascension=_optional_int(run_config.get("ascension")),
         character=str(character).strip().upper() if character is not None and str(character).strip() else None,
         progress_file=progress_file,
+        save_root=save_root,
         increment_ascension_on_win=bool(increment_on_win),
     )
 
     env_seed = os.environ.get("STS2HARNESS_SEED")
     env_ascension = os.environ.get("STS2HARNESS_ASCENSION")
     env_character = os.environ.get("STS2HARNESS_CHARACTER")
-    if env_seed is not None or env_ascension is not None or env_character is not None:
+    env_save_root = os.environ.get("STS2HARNESS_SAVE_ROOT")
+    if env_seed is not None or env_ascension is not None or env_character is not None or env_save_root is not None:
         setup = RunSetup(
             seed=env_seed.strip() if env_seed is not None and env_seed.strip() else setup.seed,
             ascension=_optional_int(env_ascension) if env_ascension is not None else setup.ascension,
             character=env_character.strip().upper() if env_character is not None and env_character.strip() else setup.character,
             progress_file=setup.progress_file,
+            save_root=env_save_root.strip() if env_save_root is not None and env_save_root.strip() else setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
         )
 
@@ -215,6 +221,7 @@ def load_run_setup(config_path: str) -> RunSetup:
             ascension=current_ascension,
             character=setup.character,
             progress_file=setup.progress_file,
+            save_root=setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
         )
     elif setup.ascension is not None:
@@ -1101,6 +1108,79 @@ def maybe_update_progress_after_state(client: Sts2Client, state: JsonDict, run_s
     }
 
 
+def _current_run_save_paths(save_root: str) -> list[str]:
+    root = os.path.expanduser(save_root)
+    matches: list[tuple[float, str]] = []
+    for dirpath, _, filenames in os.walk(root):
+        if "current_run.save" not in filenames:
+            continue
+        path = os.path.join(dirpath, "current_run.save")
+        try:
+            matches.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    matches.sort(reverse=True)
+    return [path for _, path in matches]
+
+
+def read_latest_current_run(save_root: str) -> JsonDict:
+    for path in _current_run_save_paths(save_root):
+        try:
+            data = _load_json_file(path)
+        except json.JSONDecodeError:
+            continue
+        if data:
+            data["_path"] = path
+            return data
+    raise FileNotFoundError(f"No current_run.save found under {os.path.expanduser(save_root)}")
+
+
+def verify_started_run_setup(action: Action, run_setup: RunSetup, *, timeout: float = 5.0) -> JsonDict | None:
+    request = action.request
+    if request.get("action") != "menu_select" or str(request.get("option") or "").lower() not in {"confirm", "embark"}:
+        return None
+    if "seed" not in request and "ascension" not in request:
+        return None
+
+    deadline = time.monotonic() + timeout
+    last_error: str | None = None
+    while True:
+        try:
+            current_run = read_latest_current_run(run_setup.save_root)
+            rng = current_run.get("rng")
+            actual_seed = rng.get("seed") if isinstance(rng, dict) else None
+            actual_ascension = current_run.get("ascension")
+
+            expected_seed = request.get("seed")
+            expected_ascension = request.get("ascension")
+            seed_ok = expected_seed is None or str(actual_seed) == str(expected_seed)
+            ascension_ok = expected_ascension is None or actual_ascension == expected_ascension
+
+            return {
+                "status": "ok" if seed_ok and ascension_ok else "mismatch",
+                "save_path": current_run.get("_path"),
+                "expected": {
+                    "seed": expected_seed,
+                    "ascension": expected_ascension,
+                },
+                "actual": {
+                    "seed": actual_seed,
+                    "ascension": actual_ascension,
+                    "game_mode": current_run.get("game_mode"),
+                    "start_time": current_run.get("start_time"),
+                },
+            }
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            last_error = str(exc)
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "error",
+                    "error": last_error,
+                    "save_root": os.path.expanduser(run_setup.save_root),
+                }
+            time.sleep(0.25)
+
+
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, ensure_ascii=False))
 
@@ -1170,6 +1250,9 @@ def command_act(args: argparse.Namespace) -> int:
                 progress_update = maybe_update_progress_after_state(client, after, run_setup)
                 if progress_update is not None:
                     output["progress_update"] = progress_update
+                verification = verify_started_run_setup(action, run_setup)
+                if verification is not None:
+                    output["run_setup_verification"] = verification
             except Exception as followup_exc:
                 output["followup_error"] = str(followup_exc)
         print_json(output)
@@ -1189,6 +1272,9 @@ def command_act(args: argparse.Namespace) -> int:
         progress_update = maybe_update_progress_after_state(client, after, run_setup)
         if progress_update is not None:
             output["progress_update"] = progress_update
+        verification = verify_started_run_setup(action, run_setup)
+        if verification is not None:
+            output["run_setup_verification"] = verification
 
     print_json(output)
     status = result.get("status")

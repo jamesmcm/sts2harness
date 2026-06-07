@@ -9,6 +9,9 @@ program.
 
 - `pi_agent/rpc_server.py`: JSON-RPC server exposing harness actions and memory
   file tools.
+- `pi_orchestrator/orchestrator.py`: external model loop that talks to the RPC
+  server, asks a CLI-backed LLM for one legal action, applies it, and updates
+  memory.
 - `pi_agent/config/pi_agent.example.json`: runtime config for the RPC server.
 - `pi_agent/config/official_harness.example.json`: trusted harness config for
   official Pi-agent experiments.
@@ -130,6 +133,95 @@ Example memory write:
 
 Memory paths are resolved under `memory_root`; `../` escapes are rejected.
 
+## Pi Orchestrator
+
+The RPC server does not call a model by itself. The orchestrator does that:
+
+```bash
+cd /opt/sts2harness
+uv run python pi_orchestrator/orchestrator.py \
+  --config pi_orchestrator/config/orchestrator.openai.example.json
+```
+
+For local debugging from this checkout:
+
+```bash
+uv run python pi_orchestrator/orchestrator.py \
+  --config pi_orchestrator/config/orchestrator.local.json
+```
+
+The orchestrator loop is:
+
+1. Start `pi_agent/rpc_server.py`.
+2. Call `snapshot`.
+3. Read `STRATEGY.md`, `CURRENT_RUN.md`, and `BATTLE_LOG.md`.
+4. Ask the configured CLI LLM to return JSON with one legal `action_ref`.
+5. Validate that the action is still legal.
+6. Apply memory updates.
+7. Call `act`.
+8. Append a compact decision record to `decision_log`.
+
+### OpenAI / ChatGPT
+
+Use `provider: "openai_responses"` to call the OpenAI API directly. This does
+not use the Codex CLI or your local Codex session. It needs a Platform API key:
+
+Example:
+
+```json
+{
+  "model": {
+    "provider": "openai_responses",
+    "model": "gpt-5",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "timeout": 300
+  }
+}
+```
+
+Set the model by changing `model.model`. Set the key in the environment before
+starting the orchestrator:
+
+```bash
+export OPENAI_API_KEY='...'
+```
+
+ChatGPT paid subscriptions and OpenAI API usage are separate products. A
+ChatGPT account can be used to create/manage Platform API keys if the account
+has API access and billing configured, but the orchestrator needs the API key,
+not the ChatGPT web session or Codex CLI login.
+
+### OpenCode Go / Other OpenAI-Compatible APIs
+
+Use `provider: "openai_compatible_chat"` if OpenCode Go, or another provider,
+gives you an OpenAI-compatible `/chat/completions` endpoint and API key. This
+also does not use the OpenCode CLI.
+
+Example:
+
+```json
+{
+  "model": {
+    "provider": "openai_compatible_chat",
+    "model": "MODEL_NAME_HERE",
+    "api_key_env": "OPENCODE_API_KEY",
+    "base_url": "https://OPENAI_COMPATIBLE_BASE_URL_HERE/v1",
+    "timeout": 300
+  }
+}
+```
+
+Set:
+
+```bash
+export OPENCODE_API_KEY='...'
+```
+
+The model string and base URL depend on the provider. If OpenCode Go does not
+offer an OpenAI-compatible API endpoint, we need its actual API documentation
+before wiring it in.
+
 ## Running the Experiments
 
 1. Start STS2 with STS2MCP loaded.
@@ -145,8 +237,8 @@ Memory paths are resolved under `memory_root`; `../` escapes are rejected.
 5. Interleave conditions using `experiment_schedule.example.json`; do not run
    all baseline runs before memory/tool runs.
 6. Launch the Pi RPC server for the current condition.
-7. Let the external Pi orchestrator call `snapshot`, choose an action, call
-   `act`, and update memory files as needed.
+7. Launch the Pi orchestrator with the matching OpenAI or OpenAI-compatible
+   provider config.
 8. Continue until the progress file marks `stopped: true`.
 
 The harness handles:

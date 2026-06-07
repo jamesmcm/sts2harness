@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["action_ref", "rationale"],
+  "properties": {
+    "action_ref": {
+      "type": "string",
+      "description": "Legal action index or action id from the provided actions list."
+    },
+    "rationale": {
+      "type": "string",
+      "description": "Concise reason for the selected action."
+    },
+    "memory_updates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "content", "mode"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "enum": ["STRATEGY.md", "CURRENT_RUN.md", "BATTLE_LOG.md"]
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["append", "write"]
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

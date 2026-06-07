@@ -1,0 +1,19 @@
+{
+  "rpc_server_command": [
+    "python",
+    "pi_agent/rpc_server.py",
+    "--config",
+    "/var/lib/sts2harness/official/pi_agent.json"
+  ],
+  "model": {
+    "provider": "openai_compatible_chat",
+    "model": "MODEL_NAME_HERE",
+    "api_key_env": "OPENCODE_API_KEY",
+    "base_url": "https://OPENAI_COMPATIBLE_BASE_URL_HERE/v1",
+    "timeout": 300
+  },
+  "max_steps": 200,
+  "stop_on_game_over": true,
+  "decision_log": "/var/lib/sts2harness/agents/pi-agent/decisions.jsonl",
+  "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"
+}

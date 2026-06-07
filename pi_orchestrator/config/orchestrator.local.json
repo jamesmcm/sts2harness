@@ -1,0 +1,19 @@
+{
+  "rpc_server_command": [
+    "python",
+    "pi_agent/rpc_server.py",
+    "--config",
+    "pi_agent/config/pi_agent.local.json"
+  ],
+  "model": {
+    "provider": "openai_responses",
+    "model": "gpt-5",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "https://api.openai.com/v1",
+    "timeout": 300
+  },
+  "max_steps": 200,
+  "stop_on_game_over": true,
+  "decision_log": "pi_orchestrator/runs.local.jsonl",
+  "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"
+}

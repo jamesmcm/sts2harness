@@ -1,6 +1,8 @@
 import unittest
 import json
 import os
+import sqlite3
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -198,6 +200,39 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(progress["consecutive_a10_wins"], 3)
             self.assertTrue(progress["stopped"])
 
+    def test_stop_after_current_run_marks_progress_stopped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            progress_file = str(Path(tmpdir) / "progress.json")
+            history = Path(tmpdir) / "saves" / "history"
+            history.mkdir(parents=True)
+            (history / "run1.run").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "seed": "S1",
+                        "ascension": 0,
+                        "victory": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            setup = main.RunSetup(
+                seed_set=("S1", "S2"),
+                seed_policy="fixed_list",
+                progress_file=progress_file,
+                save_root=tmpdir,
+                stop_after_current_run=True,
+            )
+
+            update = main.maybe_update_progress_after_state(
+                FakeClient([]), {"state_type": "game_over"}, setup
+            )
+
+            self.assertTrue(update["stopped"])
+            progress = main._load_json_file(progress_file)
+            self.assertTrue(progress["stopped"])
+            self.assertEqual(progress["stop_reason"], "stop_after_current_run")
+
 
 class CurrentRunVerificationTests(unittest.TestCase):
     def test_verify_started_run_setup_reads_newest_current_run_save(self):
@@ -244,6 +279,104 @@ class CurrentRunVerificationTests(unittest.TestCase):
             self.assertEqual(verification["actual"]["seed"], "ABC123")
             self.assertEqual(verification["actual"]["ascension"], 4)
             self.assertEqual(verification["actual"]["game_mode"], "custom")
+
+
+class MemoryCommitTests(unittest.TestCase):
+    def test_commit_memory_snapshot_commits_only_configured_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=tmpdir,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=tmpdir,
+                check=True,
+            )
+            Path(tmpdir, "STRATEGY.md").write_text("initial\n", encoding="utf-8")
+            Path(tmpdir, "CURRENT_RUN.md").write_text("run\n", encoding="utf-8")
+            Path(tmpdir, "BATTLE_LOG.md").write_text("log\n", encoding="utf-8")
+            Path(tmpdir, "runs.sqlite").write_text("db\n", encoding="utf-8")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(),
+                logging=main.LoggingConfig(
+                    memory_git_dir=tmpdir,
+                    memory_commit_on_run_start=True,
+                    memory_commit_paths=(
+                        "STRATEGY.md",
+                        "CURRENT_RUN.md",
+                        "BATTLE_LOG.md",
+                    ),
+                ),
+            )
+
+            result = main.commit_memory_snapshot(config, "run-1")
+
+            self.assertEqual(result["status"], "committed")
+            tracked = subprocess.run(
+                ["git", "ls-tree", "--name-only", "HEAD"],
+                cwd=tmpdir,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.splitlines()
+            self.assertEqual(
+                tracked, ["BATTLE_LOG.md", "CURRENT_RUN.md", "STRATEGY.md"]
+            )
+
+
+class InvalidActionLoggingTests(unittest.TestCase):
+    def test_nested_run_floor_and_act_are_logged(self):
+        state = {"state_type": "monster", "run": {"act": 3, "floor": 37}}
+
+        self.assertEqual(main._state_floor(state), 37)
+        self.assertEqual(main._state_act(state), 3)
+
+    def test_log_invalid_action_records_step_and_count(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                ),
+            )
+            state = {
+                "state_type": "monster",
+                "floor": 3,
+                "player": {"hp": 10, "max_hp": 80, "gold": 5},
+            }
+            start = main.start_logged_run(config, state, None)
+            self.assertEqual(start["status"], "started")
+
+            main.log_invalid_action(config, state, [], "play_card:7", "not legal")
+
+            conn = sqlite3.connect(sqlite_path)
+            run_row = conn.execute(
+                "SELECT invalid_action_count FROM runs WHERE run_id = ?",
+                (start["run_id"],),
+            ).fetchone()
+            step_row = conn.execute(
+                "SELECT action_source, action_chosen FROM steps WHERE run_id = ?",
+                (start["run_id"],),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(run_row[0], 1)
+            self.assertEqual(step_row[0], "invalid_agent")
+            self.assertIn("play_card:7", step_row[1])
 
 
 if __name__ == "__main__":

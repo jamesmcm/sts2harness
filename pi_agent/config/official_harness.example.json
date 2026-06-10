@@ -18,6 +18,7 @@
     "ascension": 0,
     "max_ascension": 10,
     "stop_after_consecutive_a10_wins": 3,
+    "stop_after_current_run": false,
     "character": "IRONCLAD",
     "progress_file": "/var/lib/sts2harness/official/pi-agent-progress.json",
     "save_root": "~/.local/share/SlayTheSpire2/steam",
@@ -26,7 +27,15 @@
   "logging": {
     "official_run_logging": true,
     "sqlite_path": "/var/lib/sts2harness/official/sts2-runs.sqlite",
-    "harness_version": "sts2harness-2026-06-06"
+    "harness_version": "sts2harness-2026-06-06",
+    "memory_git_dir": "/var/lib/sts2harness/official/agent-worktree",
+    "memory_commit_on_run_start": true,
+    "memory_commit_paths": [
+      "STRATEGY.md",
+      "CURRENT_RUN.md",
+      "BATTLE_LOG.md",
+      "HARNESS_BUGS.md"
+    ]
   },
   "auto_resolve": {
     "enabled": true,

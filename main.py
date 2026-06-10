@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 import socket
 import sqlite3
 import time
@@ -41,6 +42,7 @@ class RunSetup:
     save_root: str = DEFAULT_SAVE_ROOT
     increment_ascension_on_win: bool = True
     stop_after_consecutive_a10_wins: int = 3
+    stop_after_current_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,9 @@ class LoggingConfig:
     official_run_logging: bool = False
     harness_version: str | None = None
     git_commit: str | None = None
+    memory_git_dir: str | None = None
+    memory_commit_on_run_start: bool = False
+    memory_commit_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -252,6 +257,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
     stop_after_a10 = _optional_int(run_config.get("stop_after_consecutive_a10_wins"))
     if stop_after_a10 is None:
         stop_after_a10 = 3
+    stop_after_current = bool(run_config.get("stop_after_current_run"))
     increment_on_win = run_config.get("increment_ascension_on_win")
     if increment_on_win is None:
         increment_on_win = True
@@ -269,6 +275,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
         save_root=save_root,
         increment_ascension_on_win=bool(increment_on_win),
         stop_after_consecutive_a10_wins=stop_after_a10,
+        stop_after_current_run=stop_after_current,
     )
 
     env_seed = os.environ.get("STS2HARNESS_SEED")
@@ -300,6 +307,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
             else setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
             stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
+            stop_after_current_run=setup.stop_after_current_run,
         )
 
     progress = _load_json_file(setup.progress_file)
@@ -316,6 +324,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
             save_root=setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
             stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
+            stop_after_current_run=setup.stop_after_current_run,
         )
     elif setup.ascension is not None:
         progress["ascension"] = setup.ascension
@@ -334,6 +343,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
             save_root=setup.save_root,
             increment_ascension_on_win=setup.increment_ascension_on_win,
             stop_after_consecutive_a10_wins=setup.stop_after_consecutive_a10_wins,
+            stop_after_current_run=setup.stop_after_current_run,
         )
 
     agent_config = config.get("agent")
@@ -363,6 +373,14 @@ def load_harness_config(config_path: str) -> HarnessConfig:
             official_run_logging=bool(logging_config.get("official_run_logging")),
             harness_version=_optional_str(logging_config.get("harness_version")),
             git_commit=_optional_str(logging_config.get("git_commit")),
+            memory_git_dir=_optional_str(logging_config.get("memory_git_dir")),
+            memory_commit_on_run_start=bool(
+                logging_config.get("memory_commit_on_run_start")
+            ),
+            memory_commit_paths=_string_tuple(
+                logging_config.get("memory_commit_paths")
+                or ["STRATEGY.md", "CURRENT_RUN.md", "BATTLE_LOG.md"]
+            ),
         ),
         auto_resolve=bool(auto_config) if auto_config is not None else True,
         max_auto_actions=int(max_auto),
@@ -1304,10 +1322,9 @@ def maybe_update_progress_after_state(
     client: Sts2Client, state: JsonDict, run_setup: RunSetup
 ) -> JsonDict | None:
     del client
-    if (
-        not run_setup.increment_ascension_on_win
-        or state.get("state_type") != "game_over"
-    ):
+    if state.get("state_type") != "game_over":
+        return None
+    if not run_setup.increment_ascension_on_win and not run_setup.stop_after_current_run:
         return None
 
     try:
@@ -1336,23 +1353,24 @@ def maybe_update_progress_after_state(
     if not isinstance(consecutive_a10, int):
         consecutive_a10 = 0
 
-    if victory:
-        won_at_max = (
-            completed_ascension == run_setup.max_ascension
-            or current_ascension >= run_setup.max_ascension
-        )
-        if won_at_max:
-            consecutive_a10 += 1
-            _advance_seed_index(progress, run_setup)
+    if run_setup.increment_ascension_on_win:
+        if victory:
+            won_at_max = (
+                completed_ascension == run_setup.max_ascension
+                or current_ascension >= run_setup.max_ascension
+            )
+            if won_at_max:
+                consecutive_a10 += 1
+                _advance_seed_index(progress, run_setup)
+            else:
+                consecutive_a10 = 0
+                next_ascension = min(current_ascension + 1, run_setup.max_ascension)
+                if run_setup.seed_policy in {"fixed_list", "fixed_list_until_win"}:
+                    _advance_seed_index(progress, run_setup)
         else:
             consecutive_a10 = 0
-            next_ascension = min(current_ascension + 1, run_setup.max_ascension)
-            if run_setup.seed_policy in {"fixed_list", "fixed_list_until_win"}:
+            if run_setup.seed_policy == "fixed_list":
                 _advance_seed_index(progress, run_setup)
-    else:
-        consecutive_a10 = 0
-        if run_setup.seed_policy == "fixed_list":
-            _advance_seed_index(progress, run_setup)
 
     progress["ascension"] = next_ascension
     progress["consecutive_a10_wins"] = consecutive_a10
@@ -1366,6 +1384,9 @@ def maybe_update_progress_after_state(
         progress["stop_reason"] = (
             f"{consecutive_a10} consecutive A{run_setup.max_ascension} wins"
         )
+    if run_setup.stop_after_current_run:
+        progress["stopped"] = True
+        progress["stop_reason"] = "stop_after_current_run"
     _write_json_file(run_setup.progress_file, progress)
 
     return {
@@ -1413,6 +1434,30 @@ def read_latest_current_run(save_root: str) -> JsonDict:
     )
 
 
+def _verify_current_run_save(
+    current_run: JsonDict, expected_seed: Any, expected_ascension: Any
+) -> JsonDict:
+    rng = current_run.get("rng")
+    actual_seed = rng.get("seed") if isinstance(rng, dict) else None
+    actual_ascension = current_run.get("ascension")
+    seed_ok = expected_seed is None or str(actual_seed) == str(expected_seed)
+    ascension_ok = expected_ascension is None or actual_ascension == expected_ascension
+    return {
+        "status": "ok" if seed_ok and ascension_ok else "mismatch",
+        "save_path": current_run.get("_path"),
+        "expected": {
+            "seed": expected_seed,
+            "ascension": expected_ascension,
+        },
+        "actual": {
+            "seed": actual_seed,
+            "ascension": actual_ascension,
+            "game_mode": current_run.get("game_mode"),
+            "start_time": current_run.get("start_time"),
+        },
+    }
+
+
 def verify_started_run_setup(
     action: Action, run_setup: RunSetup, *, timeout: float = 5.0
 ) -> JsonDict | None:
@@ -1426,37 +1471,33 @@ def verify_started_run_setup(
 
     deadline = time.monotonic() + timeout
     last_error: str | None = None
+    last_verification: JsonDict | None = None
     while True:
         try:
-            current_run = read_latest_current_run(run_setup.save_root)
-            rng = current_run.get("rng")
-            actual_seed = rng.get("seed") if isinstance(rng, dict) else None
-            actual_ascension = current_run.get("ascension")
-
             expected_seed = request.get("seed")
             expected_ascension = request.get("ascension")
-            seed_ok = expected_seed is None or str(actual_seed) == str(expected_seed)
-            ascension_ok = (
-                expected_ascension is None or actual_ascension == expected_ascension
-            )
-
-            return {
-                "status": "ok" if seed_ok and ascension_ok else "mismatch",
-                "save_path": current_run.get("_path"),
-                "expected": {
-                    "seed": expected_seed,
-                    "ascension": expected_ascension,
-                },
-                "actual": {
-                    "seed": actual_seed,
-                    "ascension": actual_ascension,
-                    "game_mode": current_run.get("game_mode"),
-                    "start_time": current_run.get("start_time"),
-                },
-            }
+            verifications = []
+            for path in _current_run_save_paths(run_setup.save_root):
+                current_run = _load_json_file(path)
+                if not current_run:
+                    continue
+                current_run["_path"] = path
+                verification = _verify_current_run_save(
+                    current_run, expected_seed, expected_ascension
+                )
+                if verification["status"] == "ok":
+                    return verification
+                verifications.append(verification)
+            if verifications:
+                last_verification = verifications[0]
+            if time.monotonic() >= deadline and last_verification is not None:
+                return last_verification
+            time.sleep(0.25)
         except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
             last_error = str(exc)
             if time.monotonic() >= deadline:
+                if last_verification is not None:
+                    return last_verification
                 return {
                     "status": "error",
                     "error": last_error,
@@ -1584,7 +1625,10 @@ def _run_id(config: HarnessConfig, verification: JsonDict | None = None) -> str:
 
 
 def _state_floor(state: JsonDict) -> int | None:
-    for source in (state, _player(state)):
+    run = state.get("run")
+    if not isinstance(run, dict):
+        run = {}
+    for source in (state, run, _player(state)):
         for key in ("floor", "floor_num", "floorNum"):
             value = source.get(key)
             if isinstance(value, int):
@@ -1593,10 +1637,14 @@ def _state_floor(state: JsonDict) -> int | None:
 
 
 def _state_act(state: JsonDict) -> int | None:
-    for key in ("act", "act_num", "actNum"):
-        value = state.get(key)
-        if isinstance(value, int):
-            return value
+    run = state.get("run")
+    if not isinstance(run, dict):
+        run = {}
+    for source in (state, run):
+        for key in ("act", "act_num", "actNum"):
+            value = source.get(key)
+            if isinstance(value, int):
+                return value
     return None
 
 
@@ -1641,6 +1689,62 @@ def _set_progress_current_run_id(config: HarnessConfig, run_id: str) -> None:
     _write_json_file(config.run_setup.progress_file, progress)
 
 
+def commit_memory_snapshot(config: HarnessConfig, run_id: str) -> JsonDict | None:
+    if not config.logging.memory_commit_on_run_start:
+        return None
+    if not config.logging.memory_git_dir:
+        return {"status": "skipped", "reason": "memory_git_dir_not_configured"}
+
+    git_dir = os.path.expanduser(config.logging.memory_git_dir)
+    paths = config.logging.memory_commit_paths
+    if not paths:
+        return {"status": "skipped", "reason": "no_memory_commit_paths"}
+
+    def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=git_dir,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    add_result = run_git(["add", "-f", "--", *paths])
+    if add_result.returncode != 0:
+        return {
+            "status": "error",
+            "reason": "git_add_failed",
+            "stderr": add_result.stderr.strip(),
+        }
+
+    diff_result = run_git(["diff", "--cached", "--quiet", "--", *paths])
+    if diff_result.returncode == 0:
+        return {"status": "unchanged"}
+    if diff_result.returncode != 1:
+        return {
+            "status": "error",
+            "reason": "git_diff_failed",
+            "stderr": diff_result.stderr.strip(),
+        }
+
+    message = f"memory snapshot at run start {run_id}"
+    commit_result = run_git(["commit", "-m", message, "--", *paths])
+    if commit_result.returncode != 0:
+        return {
+            "status": "error",
+            "reason": "git_commit_failed",
+            "stderr": commit_result.stderr.strip(),
+        }
+
+    rev_result = run_git(["rev-parse", "--short", "HEAD"])
+    return {
+        "status": "committed",
+        "commit": rev_result.stdout.strip() if rev_result.returncode == 0 else None,
+        "message": message,
+    }
+
+
 def start_logged_run(
     config: HarnessConfig, state: JsonDict, verification: JsonDict | None
 ) -> JsonDict | None:
@@ -1680,7 +1784,11 @@ def start_logged_run(
     conn.commit()
     conn.close()
     _set_progress_current_run_id(config, run_id)
-    return {"status": "started", "run_id": run_id}
+    result: JsonDict = {"status": "started", "run_id": run_id}
+    memory_commit = commit_memory_snapshot(config, run_id)
+    if memory_commit is not None:
+        result["memory_commit"] = memory_commit
+    return result
 
 
 def log_step(
@@ -1741,6 +1849,75 @@ def log_step(
         UPDATE runs
         SET harness_observations = COALESCE(harness_observations, 0) + 1,
             {count_column} = COALESCE({count_column}, 0) + 1
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_invalid_action(
+    config: HarnessConfig,
+    state: JsonDict,
+    actions: list[Action],
+    action_ref: str,
+    error: str,
+) -> None:
+    conn = _connect_log_db(config)
+    run_id = _progress_current_run_id(config)
+    if conn is None or run_id is None:
+        if conn is not None:
+            conn.close()
+        return
+    row = conn.execute(
+        "SELECT COALESCE(MAX(step_index), -1) + 1 FROM steps WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    step_index = int(row[0])
+    player = _player(state)
+    relic_count, potion_count = _state_counts(state)
+    legal_actions = action_dicts(actions)
+    observation_json = json.dumps(
+        {"state": state, "actions": legal_actions}, sort_keys=True, default=str
+    )
+    chosen = {
+        "id": action_ref,
+        "status": "invalid",
+        "error": error,
+    }
+    conn.execute(
+        """
+        INSERT INTO steps (
+          run_id, step_index, floor, room_type, state_type, hp, max_hp, gold,
+          deck_size, relic_count, potion_count, legal_actions, action_chosen,
+          action_source, observation_hash, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            step_index,
+            _state_floor(state),
+            _state_room_type(state),
+            state.get("state_type"),
+            player.get("hp"),
+            player.get("max_hp"),
+            player.get("gold"),
+            _deck_size(state),
+            relic_count,
+            potion_count,
+            json.dumps(legal_actions, sort_keys=True),
+            json.dumps(chosen, sort_keys=True),
+            "invalid_agent",
+            hashlib.sha256(observation_json.encode("utf-8")).hexdigest(),
+            _now_utc(),
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE runs
+        SET harness_observations = COALESCE(harness_observations, 0) + 1,
+            invalid_action_count = COALESCE(invalid_action_count, 0) + 1
         WHERE run_id = ?
         """,
         (run_id,),
@@ -1810,6 +1987,22 @@ def auto_action_for_state(state: JsonDict, actions: list[Action]) -> Action | No
     return None
 
 
+def _state_summary(state: JsonDict) -> JsonDict:
+    player = _player(state)
+    summary: JsonDict = {
+        "state_type": state.get("state_type"),
+        "act": _state_act(state),
+        "floor": _state_floor(state),
+    }
+    if player:
+        summary["player"] = {
+            "hp": player.get("hp"),
+            "max_hp": player.get("max_hp"),
+            "gold": player.get("gold"),
+        }
+    return summary
+
+
 def resolve_auto_actions(
     client: Sts2Client,
     state: JsonDict,
@@ -1827,12 +2020,16 @@ def resolve_auto_actions(
             break
         result = client.post_action(action.request)
         log_step(config, state, actions, action, action_source="auto")
-        auto_actions.append(
-            {"action": action.as_dict(actions.index(action)), "result": result}
-        )
         if wait > 0:
             time.sleep(wait)
         state = _wait_for_play_phase(client)
+        auto_actions.append(
+            {
+                "action": action.as_dict(actions.index(action)),
+                "result": result,
+                "state_after": _state_summary(state),
+            }
+        )
     return state, auto_actions
 
 
@@ -1872,9 +2069,7 @@ def command_snapshot(args: argparse.Namespace) -> int:
     output: JsonDict = {"state": state, "actions": actions}
     if auto_actions:
         output["auto_actions"] = auto_actions
-        progress_update = maybe_update_progress_after_state(
-            client, state, config.run_setup
-        )
+    progress_update = maybe_update_progress_after_state(client, state, config.run_setup)
     if progress_update is not None:
         output["progress_update"] = progress_update
     finalize_logged_run(config, state)
@@ -1888,7 +2083,28 @@ def command_act(args: argparse.Namespace) -> int:
     before = _wait_for_play_phase(client)
     before, pre_auto_actions = resolve_auto_actions(client, before, config)
     actions = build_actions(before, config.run_setup)
-    action = find_action(actions, args.action)
+    try:
+        action = find_action(actions, args.action)
+    except ValueError as exc:
+        error = str(exc)
+        log_invalid_action(config, before, actions, args.action, error)
+        output: JsonDict = {
+            "status": "error",
+            "error": error,
+            "action_ref": args.action,
+            "state": before,
+            "actions": action_dicts(actions),
+        }
+        if pre_auto_actions:
+            output["pre_auto_actions"] = pre_auto_actions
+        progress_update = maybe_update_progress_after_state(
+            client, before, config.run_setup
+        )
+        if progress_update is not None:
+            output["progress_update"] = progress_update
+        finalize_logged_run(config, before)
+        print_json(output)
+        return 1
     start_action = (
         action.request.get("action") == "menu_select"
         and str(action.request.get("option") or "").lower() in {"confirm", "embark"}

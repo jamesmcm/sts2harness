@@ -56,6 +56,7 @@ Example official-run config:
     "ascension": 0,
     "max_ascension": 10,
     "stop_after_consecutive_a10_wins": 3,
+    "stop_after_current_run": false,
     "character": "IRONCLAD",
     "progress_file": "/var/lib/sts2harness/official/progress.json",
     "save_root": "~/.local/share/SlayTheSpire2/steam",
@@ -64,7 +65,15 @@ Example official-run config:
   "logging": {
     "official_run_logging": true,
     "sqlite_path": "/var/lib/sts2harness/official/runs.sqlite",
-    "harness_version": "sts2harness-2026-06-06"
+    "harness_version": "sts2harness-2026-06-06",
+    "memory_git_dir": "/var/lib/sts2harness/official/agent-worktree",
+    "memory_commit_on_run_start": true,
+    "memory_commit_paths": [
+      "STRATEGY.md",
+      "CURRENT_RUN.md",
+      "BATTLE_LOG.md",
+      "HARNESS_BUGS.md"
+    ]
   },
   "auto_resolve": {
     "enabled": true,
@@ -92,6 +101,13 @@ For all policies, a win below A10 increments ascension by one, up to
 seed when a `seed_set` exists. After
 `stop_after_consecutive_a10_wins` consecutive A10 wins, the progress file is
 marked stopped and the custom-run start action is no longer offered.
+Set `stop_after_current_run` to `true` when you want the current in-progress
+run to be the final run in the experiment; the harness marks progress stopped
+after the next `game_over` state.
+
+When `logging.memory_commit_on_run_start` is enabled, the harness commits the
+configured `memory_commit_paths` inside `memory_git_dir` when a new run is
+logged. Keep SQLite databases outside that git worktree.
 
 ## Running Agents
 

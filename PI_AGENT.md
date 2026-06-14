@@ -10,7 +10,7 @@ program.
 - `pi_agent/rpc_server.py`: JSON-RPC server exposing harness actions and memory
   file tools.
 - `pi_orchestrator/orchestrator.py`: external model loop that talks to the RPC
-  server, asks a CLI-backed LLM for one legal action, applies it, and updates
+  server, asks a hosted LLM for one legal action, applies it, and updates
   memory.
 - `pi_agent/config/pi_agent.example.json`: runtime config for the RPC server.
 - `pi_agent/config/official_harness.example.json`: trusted harness config for
@@ -161,6 +161,9 @@ The orchestrator loop is:
 7. Call `act`.
 8. Append a compact decision record to `decision_log`.
 
+`act` always returns a fresh post-action state/actions payload because allowing
+blind follow-up commands makes stale action queues too easy.
+
 ### OpenAI / ChatGPT
 
 Use `provider: "openai_responses"` to call the OpenAI API directly. This does
@@ -221,6 +224,23 @@ export OPENCODE_API_KEY='...'
 The model string and base URL depend on the provider. If OpenCode Go does not
 offer an OpenAI-compatible API endpoint, we need its actual API documentation
 before wiring it in.
+
+### OpenRouter / Kimi K2.6
+
+Use `provider: "openrouter"` for OpenRouter. It defaults to
+`https://openrouter.ai/api/v1` and `OPENROUTER_API_KEY`.
+
+Example config:
+
+```text
+pi_orchestrator/config/orchestrator.openrouter-kimi.example.json
+```
+
+As of June 14, 2026, OpenRouter lists Kimi K2.6 as:
+
+```text
+moonshotai/kimi-k2.6
+```
 
 ## Running the Experiments
 

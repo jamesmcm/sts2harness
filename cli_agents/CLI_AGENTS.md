@@ -123,6 +123,22 @@ If the OpenCode agent profile should not have broad tools, configure that in
 OpenCode itself. The important harness-side rule is the same: the only game
 control entrypoint it receives is the wrapper command.
 
+## OpenCode Supervised Loop
+
+For CLIs where we cannot control exactly when the agent stops or what it does
+between tool calls, prefer the supervisor:
+
+```bash
+uv run python cli_agents/cli_orchestrator.py \
+  --config cli_agents/config/opencode_cli_orchestrator.example.json
+```
+
+The supervisor calls `sts2harness-opencode snapshot`, runs one bounded agent
+command, calls `snapshot` again, and writes a JSONL record. On later iterations
+it uses the configured `resume_command`, such as `opencode run --resume ...`.
+This does not make a broad CLI fully trustworthy, but it gives the experiment a
+harness-owned state check and log boundary between agent turns.
+
 ## Agent Instructions
 
 Give every CLI agent these rules:
@@ -161,4 +177,3 @@ uv run python main.py --config sts2harness.json act 0
 
 This is not a secure official setup because the agent could modify local config
 or code if it has workspace write access.
-

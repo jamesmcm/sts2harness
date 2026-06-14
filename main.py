@@ -82,12 +82,14 @@ class Action:
     category: str
     request: JsonDict
     notes: tuple[str, ...] = ()
+    enabled: bool = True
 
     def as_dict(self, index: int | None = None) -> JsonDict:
         result: JsonDict = {
             "id": self.id,
             "label": self.label,
             "category": self.category,
+            "enabled": self.enabled,
             "request": self.request,
         }
         if index is not None:
@@ -437,6 +439,34 @@ def _alive_enemies(state: JsonDict) -> list[JsonDict]:
     return enemies if isinstance(enemies, list) else []
 
 
+def _current_energy(state: JsonDict) -> int | None:
+    player = _player(state)
+    battle = _battle(state)
+    for source in (player, battle):
+        for key in ("energy", "current_energy", "energy_current"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        energy = source.get("energy")
+        if isinstance(energy, dict):
+            for key in ("current", "amount"):
+                value = energy.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+    return None
+
+
+def _playable_hand_cards(state: JsonDict) -> list[JsonDict]:
+    hand = _player(state).get("hand")
+    if not isinstance(hand, list):
+        return []
+    return [
+        card
+        for card in hand
+        if isinstance(card, dict) and card.get("can_play") is True
+    ]
+
+
 def _combat_like(state_type: str) -> bool:
     return state_type in {"monster", "elite", "boss"}
 
@@ -651,57 +681,68 @@ def _global_potion_actions(state: JsonDict) -> list[Action]:
 
 def _combat_actions(state: JsonDict) -> list[Action]:
     battle = _battle(state)
-    player = _player(state)
     actions: list[Action] = []
 
     if battle.get("is_play_phase") is not True or battle.get("turn") != "player":
         return actions
 
-    hand = player.get("hand")
     enemies = _alive_enemies(state)
-    if isinstance(hand, list):
-        for card in hand:
-            if not isinstance(card, dict) or card.get("can_play") is not True:
-                continue
-            index = card.get("index")
-            if not isinstance(index, int):
-                continue
-            card_name = _name(card, "name", "id", fallback=f"card {index}")
-            target_type = str(card.get("target_type") or "")
-            if target_type == "AnyEnemy":
-                for enemy in enemies:
-                    entity_id = enemy.get("entity_id")
-                    if not entity_id:
-                        continue
-                    enemy_name = _name(enemy, "name", "entity_id")
-                    actions.append(
-                        Action(
-                            id=f"play_card:{index}:{_slug(entity_id)}",
-                            label=f"Play hand[{index}] {card_name} on {enemy_name}",
-                            category="combat",
-                            request={
-                                "action": "play_card",
-                                "card_index": index,
-                                "target": entity_id,
-                            },
-                        )
-                    )
-            else:
+    playable_cards = _playable_hand_cards(state)
+    for card in playable_cards:
+        index = card.get("index")
+        if not isinstance(index, int):
+            continue
+        card_name = _name(card, "name", "id", fallback=f"card {index}")
+        target_type = str(card.get("target_type") or "")
+        if target_type == "AnyEnemy":
+            for enemy in enemies:
+                entity_id = enemy.get("entity_id")
+                if not entity_id:
+                    continue
+                enemy_name = _name(enemy, "name", "entity_id")
                 actions.append(
                     Action(
-                        id=f"play_card:{index}",
-                        label=f"Play hand[{index}] {card_name}",
+                        id=f"play_card:{index}:{_slug(entity_id)}",
+                        label=f"Play hand[{index}] {card_name} on {enemy_name}",
                         category="combat",
-                        request={"action": "play_card", "card_index": index},
+                        request={
+                            "action": "play_card",
+                            "card_index": index,
+                            "target": entity_id,
+                        },
                     )
                 )
+        else:
+            actions.append(
+                Action(
+                    id=f"play_card:{index}",
+                    label=f"Play hand[{index}] {card_name}",
+                    category="combat",
+                    request={"action": "play_card", "card_index": index},
+                )
+            )
 
+    end_turn_id = "end_turn"
+    notes: tuple[str, ...] = ()
+    energy = _current_energy(state)
+    if energy is not None and energy > 0 and playable_cards:
+        end_turn_id = "end_turn_confirm"
+        notes = (
+            f"Confirmation required: {energy} energy and "
+            f"{len(playable_cards)} playable card(s) remain.",
+            "Use this only when intentionally ending the turn.",
+        )
     actions.append(
         Action(
-            id="end_turn",
-            label="End turn",
+            id=end_turn_id,
+            label=(
+                "Confirm end turn"
+                if end_turn_id == "end_turn_confirm"
+                else "End turn"
+            ),
             category="combat",
             request={"action": "end_turn"},
+            notes=notes,
         )
     )
     return actions
@@ -919,9 +960,21 @@ def _reward_actions(state: JsonDict) -> list[Action]:
         if not isinstance(index, int):
             continue
         reward_type = str(item.get("type") or "reward")
-        if reward_type == "potion" and potion_full:
-            continue
         label = _reward_label(item, index)
+        if reward_type == "potion" and potion_full:
+            actions.append(
+                Action(
+                    id=f"rewards_claim:{index}:disabled",
+                    label=label,
+                    category="rewards",
+                    request={"action": "claim_reward", "index": index},
+                    notes=(
+                        "Disabled: potion slots are full. Discard a potion before claiming this reward.",
+                    ),
+                    enabled=False,
+                )
+            )
+            continue
         actions.append(
             Action(
                 id=f"rewards_claim:{index}",
@@ -1223,13 +1276,18 @@ def action_dicts(actions: list[Action]) -> list[JsonDict]:
 def find_action(actions: list[Action], action_ref: str) -> Action:
     if action_ref.isdigit():
         index = int(action_ref)
-        if 0 <= index < len(actions):
+        if 0 <= index < len(actions) and actions[index].enabled:
             return actions[index]
+        if 0 <= index < len(actions):
+            raise ValueError(f"action index {index} is currently disabled")
         raise ValueError(f"action index {index} is not currently legal")
 
-    matches = [action for action in actions if action.id == action_ref]
+    matches = [action for action in actions if action.id == action_ref and action.enabled]
     if len(matches) == 1:
         return matches[0]
+    disabled_matches = [action for action in actions if action.id == action_ref]
+    if disabled_matches:
+        raise ValueError(f"action_id {action_ref!r} is currently disabled")
     if not matches:
         raise ValueError(f"action_id {action_ref!r} is not currently legal")
     raise ValueError(
@@ -1971,19 +2029,26 @@ def _extract_int(value: JsonDict, *keys: str) -> int | None:
 
 
 def auto_action_for_state(state: JsonDict, actions: list[Action]) -> Action | None:
-    if not actions or state.get("state_type") == "game_over":
+    enabled_actions = [action for action in actions if action.enabled]
+    if not enabled_actions or state.get("state_type") == "game_over":
         return None
-    if len(actions) != 1:
-        return None
-    action = actions[0]
-    if action.id in {
-        "proceed_to_map",
-        "event_advance_dialogue",
-        "crystal_sphere_proceed",
-    }:
-        return action
-    if action.category == "map":
-        return action
+    if state.get("state_type") == "rewards":
+        for action in enabled_actions:
+            if action.id.startswith("rewards_claim:") and "gold" in action.label:
+                return action
+    if len(enabled_actions) == 1:
+        action = enabled_actions[0]
+        if action.id in {
+            "proceed_to_map",
+            "event_advance_dialogue",
+            "crystal_sphere_proceed",
+            "combat_confirm_selection",
+            "deck_confirm_selection",
+            "bundle_confirm_selection",
+        }:
+            return action
+        if action.category == "map":
+            return action
     return None
 
 
@@ -2129,33 +2194,32 @@ def command_act(args: argparse.Namespace) -> int:
                 ),
             },
         }
-        if not args.no_after:
-            if args.wait > 0:
-                time.sleep(args.wait)
-            try:
-                after = _wait_for_play_phase(client)
-                after, post_auto_actions = resolve_auto_actions(client, after, config)
-                output["state"] = after
-                output["actions"] = action_dicts(build_actions(after, config.run_setup))
-                if post_auto_actions:
-                    output["auto_actions"] = post_auto_actions
-                progress_update = maybe_update_progress_after_state(
-                    client, after, config.run_setup
-                )
-                if progress_update is not None:
-                    output["progress_update"] = progress_update
-                finalize_logged_run(config, after)
-                verification = verify_started_run_setup(action, config.run_setup)
-                if verification is not None:
-                    output["run_setup_verification"] = verification
-                    log_start = start_logged_run(config, after, verification)
-                    if log_start is not None:
-                        output["run_log"] = log_start
-                        log_step(
-                            config, before, actions, action, action_source="agent"
-                        )
-            except Exception as followup_exc:
-                output["followup_error"] = str(followup_exc)
+        if args.wait > 0:
+            time.sleep(args.wait)
+        try:
+            after = _wait_for_play_phase(client)
+            after, post_auto_actions = resolve_auto_actions(client, after, config)
+            output["state"] = after
+            output["actions"] = action_dicts(build_actions(after, config.run_setup))
+            if post_auto_actions:
+                output["auto_actions"] = post_auto_actions
+            progress_update = maybe_update_progress_after_state(
+                client, after, config.run_setup
+            )
+            if progress_update is not None:
+                output["progress_update"] = progress_update
+            finalize_logged_run(config, after)
+            verification = verify_started_run_setup(action, config.run_setup)
+            if verification is not None:
+                output["run_setup_verification"] = verification
+                log_start = start_logged_run(config, after, verification)
+                if log_start is not None:
+                    output["run_log"] = log_start
+                    log_step(
+                        config, before, actions, action, action_source="agent"
+                    )
+        except Exception as followup_exc:
+            output["followup_error"] = str(followup_exc)
         print_json(output)
         return 0
 
@@ -2167,26 +2231,25 @@ def command_act(args: argparse.Namespace) -> int:
     if not pre_auto_actions:
         output.pop("pre_auto_actions")
 
-    if not args.no_after:
-        if args.wait > 0:
-            time.sleep(args.wait)
-        after = _wait_for_play_phase(client)
-        after, post_auto_actions = resolve_auto_actions(client, after, config)
-        output["state"] = after
-        output["actions"] = action_dicts(build_actions(after, config.run_setup))
-        if post_auto_actions:
-            output["auto_actions"] = post_auto_actions
-        progress_update = maybe_update_progress_after_state(client, after, config.run_setup)
-        if progress_update is not None:
-            output["progress_update"] = progress_update
-        finalize_logged_run(config, after)
-        verification = verify_started_run_setup(action, config.run_setup)
-        if verification is not None:
-            output["run_setup_verification"] = verification
-            log_start = start_logged_run(config, after, verification)
-            if log_start is not None:
-                output["run_log"] = log_start
-                log_step(config, before, actions, action, action_source="agent")
+    if args.wait > 0:
+        time.sleep(args.wait)
+    after = _wait_for_play_phase(client)
+    after, post_auto_actions = resolve_auto_actions(client, after, config)
+    output["state"] = after
+    output["actions"] = action_dicts(build_actions(after, config.run_setup))
+    if post_auto_actions:
+        output["auto_actions"] = post_auto_actions
+    progress_update = maybe_update_progress_after_state(client, after, config.run_setup)
+    if progress_update is not None:
+        output["progress_update"] = progress_update
+    finalize_logged_run(config, after)
+    verification = verify_started_run_setup(action, config.run_setup)
+    if verification is not None:
+        output["run_setup_verification"] = verification
+        log_start = start_logged_run(config, after, verification)
+        if log_start is not None:
+            output["run_log"] = log_start
+            log_step(config, before, actions, action, action_source="agent")
 
     print_json(output)
     status = result.get("status")
@@ -2239,11 +2302,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute a currently legal action by index or ID.",
     )
     act_parser.add_argument("action", help="Action index or action ID from `actions`.")
-    act_parser.add_argument(
-        "--no-after",
-        action="store_true",
-        help="Only print the action result, not the next state/actions.",
-    )
     act_parser.add_argument(
         "--wait",
         type=float,

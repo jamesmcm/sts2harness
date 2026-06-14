@@ -7,14 +7,17 @@ the current `get_game_state(format=json)` payload and narrows it to the actions
 that are legal on the current screen, following the UI flow documented in the
 Slay the Spire 2 harness notes:
 
-- combat: playable cards, legal targets, usable potions, end turn
+- combat: playable cards, legal targets, usable potions, end turn; ending the
+  turn with energy and playable cards remaining requires the explicit
+  `end_turn_confirm` action
 - hand selection: selectable hand cards and confirm
 - map: travelable map nodes
 - event: visible unlocked options, or dialogue advance
 - shop/fake merchant: stocked affordable purchases, with potion purchases hidden
   when potion slots are full, plus leave/proceed even while the inventory is open
-- rewards: claimable rewards, with potion rewards hidden when potion slots are
-  full, card reward pick/skip, proceed
+- rewards: claimable rewards, with gold auto-claimed by the harness and potion
+  rewards shown disabled when potion slots are full, card reward pick/skip,
+  proceed
 - rest site: enabled rest options, proceed
 - card selection: select, confirm, cancel for upgrade/transform/remove flows
 - treasure, relic choice, bundle choice, Crystal Sphere, menu/game-over flows
@@ -35,6 +38,39 @@ Use a different mod URL if needed:
 ```bash
 uv run python main.py --base-url http://localhost:15526 actions
 ```
+
+## Offline Experiment Launch
+
+For network-isolated experiments, start Steam once normally and switch it to
+Offline Mode, then fully close Steam. After that, launch STS2 through Steam
+inside a loopback-only network namespace:
+
+```bash
+sudo -E scripts/run_sts2_steam_netns.sh
+```
+
+The script runs `steam -offline -applaunch 2868840` as the invoking desktop
+user inside a temporary `ip netns` namespace named `sts2-offline` with only
+`lo` enabled. This keeps
+STS2MCP reachable on `localhost:15526` from processes in the same namespace,
+while blocking external network access for Steam and the game.
+
+The script refuses to run if Steam is already running for the desktop user,
+because the command-line launcher can delegate to an existing client outside the
+namespace.
+
+If the harness runs outside that namespace, expose or proxy the STS2MCP port, or
+run the harness from the same namespace:
+
+```bash
+sudo ip netns exec sts2-offline sudo -E -H -u "$USER" \
+  env UV_CACHE_DIR=/tmp/uv-cache \
+  uv run python main.py snapshot
+```
+
+A direct game launch without the Steam client currently fails Steamworks
+initialization before normal mod startup, so this workflow keeps the legitimate
+Steam platform path while removing Internet access.
 
 ## Harness-Managed Run Setup
 
@@ -128,6 +164,9 @@ only dispatches the action if the ID or numeric action index is still legal. It
 then returns the post-action state and next legal actions by default. This
 prevents stale card/reward indices from being reused after a previous action
 shifted the UI.
+
+`act` always reads and returns the next state/actions so agents cannot
+intentionally queue blind follow-up actions.
 
 If STS2MCP times out while executing an action, `act` returns structured JSON
 instead of a traceback:

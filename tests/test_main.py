@@ -119,6 +119,80 @@ class RunSetupActionTests(unittest.TestCase):
         )
 
 
+class ActionGenerationTests(unittest.TestCase):
+    def test_end_turn_requires_confirmation_with_energy_and_playable_cards(self):
+        state = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 1,
+                "hand": [{"index": 0, "name": "Defend", "can_play": True}],
+            },
+        }
+
+        actions = main.build_actions(state)
+
+        self.assertIn("end_turn_confirm", [action.id for action in actions])
+        self.assertNotIn("end_turn", [action.id for action in actions])
+
+    def test_end_turn_does_not_require_confirmation_without_playable_cards(self):
+        state = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 1,
+                "hand": [{"index": 0, "name": "Defend", "can_play": False}],
+            },
+        }
+
+        actions = main.build_actions(state)
+
+        self.assertIn("end_turn", [action.id for action in actions])
+
+    def test_full_potion_reward_is_visible_but_disabled(self):
+        state = {
+            "state_type": "rewards",
+            "player": {
+                "max_potion_slots": 1,
+                "potions": [{"slot": 0, "name": "Fire Potion"}],
+            },
+            "rewards": {
+                "items": [
+                    {"index": 0, "type": "potion", "potion_name": "Dex Potion"}
+                ]
+            },
+        }
+
+        actions = main.build_actions(state)
+        action = next(
+            action for action in actions if action.id == "rewards_claim:0:disabled"
+        )
+
+        self.assertEqual(action.id, "rewards_claim:0:disabled")
+        self.assertFalse(action.enabled)
+        self.assertIn("potion slots are full", action.notes[0])
+        with self.assertRaisesRegex(ValueError, "disabled"):
+            main.find_action(actions, "rewards_claim:0:disabled")
+
+    def test_auto_action_claims_gold_reward_even_with_other_actions(self):
+        state = {
+            "state_type": "rewards",
+            "rewards": {
+                "items": [
+                    {"index": 0, "type": "gold", "gold_amount": 25},
+                    {"index": 1, "type": "relic", "description": "Anchor"},
+                ],
+                "can_proceed": True,
+            },
+        }
+        actions = main.build_actions(state)
+
+        action = main.auto_action_for_state(state, actions)
+
+        self.assertIsNotNone(action)
+        self.assertEqual(action.request, {"action": "claim_reward", "index": 0})
+
+
 class ProgressTests(unittest.TestCase):
     def test_history_win_increments_ascension_once(self):
         with tempfile.TemporaryDirectory() as tmpdir:

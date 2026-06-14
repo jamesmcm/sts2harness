@@ -1,0 +1,32 @@
+{
+  "harness_command": [
+    "sts2harness-opencode"
+  ],
+  "agent_command": [
+    "opencode",
+    "run",
+    "--dir",
+    "/var/lib/sts2harness/agents/opencode",
+    "--model",
+    "PROVIDER/MODEL",
+    "--agent",
+    "build"
+  ],
+  "resume_command": [
+    "opencode",
+    "run",
+    "--resume",
+    "--dir",
+    "/var/lib/sts2harness/agents/opencode",
+    "--model",
+    "PROVIDER/MODEL",
+    "--agent",
+    "build"
+  ],
+  "workspace": "/var/lib/sts2harness/agents/opencode",
+  "prompt_path": "cli_agents/prompts/opencode_cli_agent.md",
+  "log_path": "/var/lib/sts2harness/agents/opencode/supervisor.jsonl",
+  "max_iterations": 200,
+  "stop_on_game_over": true,
+  "timeout": 900
+}

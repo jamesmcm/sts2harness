@@ -149,8 +149,6 @@ class PiRpcServer:
         }
         if pre_auto_actions:
             output["pre_auto_actions"] = pre_auto_actions
-        if params.get("no_after") is True:
-            return output
         if wait > 0:
             time.sleep(wait)
         after = harness._wait_for_play_phase(self.client)

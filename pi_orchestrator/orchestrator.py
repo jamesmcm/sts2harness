@@ -241,13 +241,27 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
         raise RuntimeError("OpenAI-compatible API returned no message content")
 
 
+class OpenRouterProvider(OpenAICompatibleChatProvider):
+    def __init__(self, config: ModelConfig) -> None:
+        config = ModelConfig(
+            provider=config.provider,
+            model=config.model,
+            api_key_env=config.api_key_env or "OPENROUTER_API_KEY",
+            base_url=config.base_url or "https://openrouter.ai/api/v1",
+            timeout=config.timeout,
+        )
+        super().__init__(config)
+
+
 def make_provider(config: ModelConfig) -> ModelProvider:
     if config.provider == "openai_responses":
         return OpenAIResponsesProvider(config)
     if config.provider == "openai_compatible_chat":
         return OpenAICompatibleChatProvider(config)
+    if config.provider == "openrouter":
+        return OpenRouterProvider(config)
     raise ValueError(
-        "model.provider must be openai_responses or openai_compatible_chat"
+        "model.provider must be openai_responses, openai_compatible_chat, or openrouter"
     )
 
 

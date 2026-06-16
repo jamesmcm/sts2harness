@@ -461,9 +461,7 @@ def _playable_hand_cards(state: JsonDict) -> list[JsonDict]:
     if not isinstance(hand, list):
         return []
     return [
-        card
-        for card in hand
-        if isinstance(card, dict) and card.get("can_play") is True
+        card for card in hand if isinstance(card, dict) and card.get("can_play") is True
     ]
 
 
@@ -736,9 +734,7 @@ def _combat_actions(state: JsonDict) -> list[Action]:
         Action(
             id=end_turn_id,
             label=(
-                "Confirm end turn"
-                if end_turn_id == "end_turn_confirm"
-                else "End turn"
+                "Confirm end turn" if end_turn_id == "end_turn_confirm" else "End turn"
             ),
             category="combat",
             request={"action": "end_turn"},
@@ -1282,7 +1278,9 @@ def find_action(actions: list[Action], action_ref: str) -> Action:
             raise ValueError(f"action index {index} is currently disabled")
         raise ValueError(f"action index {index} is not currently legal")
 
-    matches = [action for action in actions if action.id == action_ref and action.enabled]
+    matches = [
+        action for action in actions if action.id == action_ref and action.enabled
+    ]
     if len(matches) == 1:
         return matches[0]
     disabled_matches = [action for action in actions if action.id == action_ref]
@@ -1382,7 +1380,10 @@ def maybe_update_progress_after_state(
     del client
     if state.get("state_type") != "game_over":
         return None
-    if not run_setup.increment_ascension_on_win and not run_setup.stop_after_current_run:
+    if (
+        not run_setup.increment_ascension_on_win
+        and not run_setup.stop_after_current_run
+    ):
         return None
 
     try:
@@ -1984,6 +1985,103 @@ def log_invalid_action(
     conn.close()
 
 
+def record_model_telemetry(
+    config: HarnessConfig,
+    *,
+    prompt_hash: str | None = None,
+    response_hash: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    tool_calls: JsonDict | list[Any] | None = None,
+    model_calls: int = 1,
+) -> JsonDict:
+    conn = _connect_log_db(config)
+    run_id = _progress_current_run_id(config)
+    if conn is None or run_id is None:
+        if conn is not None:
+            conn.close()
+        return {"status": "skipped", "reason": "logging_not_active"}
+
+    row = conn.execute(
+        """
+        SELECT id FROM steps
+        WHERE run_id = ? AND action_source IN ('agent', 'invalid_agent')
+        ORDER BY step_index DESC
+        LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return {"status": "skipped", "reason": "no_agent_step", "run_id": run_id}
+
+    tool_calls_json = (
+        json.dumps(tool_calls, sort_keys=True, default=str)
+        if tool_calls is not None
+        else None
+    )
+    conn.execute(
+        """
+        UPDATE steps
+        SET prompt_hash = COALESCE(?, prompt_hash),
+            response_hash = COALESCE(?, response_hash),
+            tool_calls = COALESCE(?, tool_calls)
+        WHERE id = ?
+        """,
+        (prompt_hash, response_hash, tool_calls_json, row[0]),
+    )
+
+    tool_count = _tool_call_count(tool_calls)
+    conn.execute(
+        """
+        UPDATE runs
+        SET total_model_calls = COALESCE(total_model_calls, 0) + ?,
+            total_input_tokens = COALESCE(total_input_tokens, 0) + ?,
+            total_output_tokens = COALESCE(total_output_tokens, 0) + ?,
+            total_tool_calls = COALESCE(total_tool_calls, 0) + ?
+        WHERE run_id = ?
+        """,
+        (
+            max(0, int(model_calls)),
+            max(0, int(input_tokens or 0)),
+            max(0, int(output_tokens or 0)),
+            tool_count,
+            run_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "status": "recorded",
+        "run_id": run_id,
+        "step_id": row[0],
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tool_calls": tool_count,
+    }
+
+
+def _tool_call_count(tool_calls: JsonDict | list[Any] | None) -> int:
+    if tool_calls is None:
+        return 0
+    if isinstance(tool_calls, list):
+        return len(tool_calls)
+    if not isinstance(tool_calls, dict):
+        return 0
+    total = tool_calls.get("total")
+    if isinstance(total, int) and not isinstance(total, bool):
+        return total
+    count = 0
+    for value in tool_calls.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            count += value
+        elif isinstance(value, list):
+            count += len(value)
+    return count
+
+
 def finalize_logged_run(config: HarnessConfig, state: JsonDict) -> None:
     conn = _connect_log_db(config)
     run_id = _progress_current_run_id(config)
@@ -2170,10 +2268,9 @@ def command_act(args: argparse.Namespace) -> int:
         finalize_logged_run(config, before)
         print_json(output)
         return 1
-    start_action = (
-        action.request.get("action") == "menu_select"
-        and str(action.request.get("option") or "").lower() in {"confirm", "embark"}
-    )
+    start_action = action.request.get("action") == "menu_select" and str(
+        action.request.get("option") or ""
+    ).lower() in {"confirm", "embark"}
     if not start_action:
         log_step(config, before, actions, action, action_source="agent")
     try:
@@ -2215,9 +2312,7 @@ def command_act(args: argparse.Namespace) -> int:
                 log_start = start_logged_run(config, after, verification)
                 if log_start is not None:
                     output["run_log"] = log_start
-                    log_step(
-                        config, before, actions, action, action_source="agent"
-                    )
+                    log_step(config, before, actions, action, action_source="agent")
         except Exception as followup_exc:
             output["followup_error"] = str(followup_exc)
         print_json(output)

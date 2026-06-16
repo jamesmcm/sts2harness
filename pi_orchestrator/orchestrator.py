@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -67,7 +68,9 @@ def load_config(path: str | Path) -> OrchestratorConfig:
         ),
         max_steps=int(raw.get("max_steps", 200)),
         stop_on_game_over=bool(raw.get("stop_on_game_over", True)),
-        decision_log=str(raw.get("decision_log") or HARNESS_ROOT / "pi_orchestrator" / "runs.jsonl"),
+        decision_log=str(
+            raw.get("decision_log") or HARNESS_ROOT / "pi_orchestrator" / "runs.jsonl"
+        ),
         prompt_template=str(
             raw.get("prompt_template")
             or HARNESS_ROOT / "pi_orchestrator" / "prompts" / "decision_prompt.md"
@@ -132,8 +135,17 @@ class JsonRpcClient:
 
 
 class ModelProvider:
-    def complete_json(self, prompt: str) -> JsonDict:
+    def complete_json(self, prompt: str) -> "ModelCompletion":
         raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ModelCompletion:
+    decision: JsonDict
+    raw_response: JsonDict
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class HttpJsonProvider(ModelProvider):
@@ -172,7 +184,7 @@ class HttpJsonProvider(ModelProvider):
 
 
 class OpenAIResponsesProvider(HttpJsonProvider):
-    def complete_json(self, prompt: str) -> JsonDict:
+    def complete_json(self, prompt: str) -> ModelCompletion:
         base_url = self.config.base_url or "https://api.openai.com/v1"
         payload: JsonDict = {
             "model": self.config.model,
@@ -194,7 +206,7 @@ class OpenAIResponsesProvider(HttpJsonProvider):
         response = self._post_json(f"{base_url.rstrip('/')}/responses", payload)
         text = response.get("output_text")
         if isinstance(text, str) and text.strip():
-            return _parse_json_text(text)
+            return _completion_from_response(_parse_json_text(text), response)
         output = response.get("output")
         if isinstance(output, list):
             for item in output:
@@ -205,12 +217,14 @@ class OpenAIResponsesProvider(HttpJsonProvider):
                     continue
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        return _parse_json_text(part["text"])
+                        return _completion_from_response(
+                            _parse_json_text(part["text"]), response
+                        )
         raise RuntimeError("OpenAI Responses API returned no text output")
 
 
 class OpenAICompatibleChatProvider(HttpJsonProvider):
-    def complete_json(self, prompt: str) -> JsonDict:
+    def complete_json(self, prompt: str) -> ModelCompletion:
         if not self.config.base_url:
             raise RuntimeError("openai_compatible_chat requires model.base_url")
         payload: JsonDict = {
@@ -235,9 +249,13 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
         )
         choices = response.get("choices")
         if isinstance(choices, list) and choices:
-            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            message = (
+                choices[0].get("message") if isinstance(choices[0], dict) else None
+            )
             if isinstance(message, dict) and isinstance(message.get("content"), str):
-                return _parse_json_text(message["content"])
+                return _completion_from_response(
+                    _parse_json_text(message["content"]), response
+                )
         raise RuntimeError("OpenAI-compatible API returned no message content")
 
 
@@ -282,6 +300,42 @@ def _parse_json_text(text: str) -> JsonDict:
     return value
 
 
+def _completion_from_response(
+    decision: JsonDict, response: JsonDict
+) -> ModelCompletion:
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    return ModelCompletion(
+        decision=decision,
+        raw_response=response,
+        input_tokens=_usage_int(
+            usage, "input_tokens", "prompt_tokens", "total_input_tokens"
+        ),
+        output_tokens=_usage_int(
+            usage, "output_tokens", "completion_tokens", "total_output_tokens"
+        ),
+        total_tokens=_usage_int(usage, "total_tokens"),
+    )
+
+
+def _usage_int(usage: JsonDict, *keys: str) -> int | None:
+    for key in keys:
+        value = usage.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_json(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def build_prompt(template_path: str, snapshot: JsonDict, memory: JsonDict) -> str:
     template = Path(template_path).read_text(encoding="utf-8")
     return template.replace(
@@ -313,6 +367,13 @@ def apply_memory_updates(rpc: JsonRpcClient, decision: JsonDict) -> None:
         mode = str(update.get("mode") or "append")
         method = "write_memory" if mode == "write" else "append_memory"
         rpc.call(method, {"path": str(path), "content": str(content)})
+
+
+def count_memory_updates(decision: JsonDict) -> int:
+    updates = decision.get("memory_updates")
+    if not isinstance(updates, list):
+        return 0
+    return sum(1 for update in updates if isinstance(update, dict))
 
 
 def validate_action(decision: JsonDict, actions: list[JsonDict]) -> str:
@@ -363,10 +424,37 @@ def run(config: OrchestratorConfig) -> int:
                 raise RuntimeError("no legal actions available")
             memory = read_memory_bundle(rpc)
             prompt = build_prompt(config.prompt_template, snapshot, memory)
-            decision = provider.complete_json(prompt)
-            action_ref = validate_action(decision, actions)
-            apply_memory_updates(rpc, decision)
+            completion = provider.complete_json(prompt)
+            decision = completion.decision
+            action_ref = str(decision.get("action_ref") or "")
+            validation_error = None
+            try:
+                action_ref = validate_action(decision, actions)
+            except ValueError as exc:
+                validation_error = str(exc)
+            memory_update_count = 0
+            if validation_error is None:
+                memory_update_count = count_memory_updates(decision)
+                apply_memory_updates(rpc, decision)
             result = rpc.call("act", {"action": action_ref})
+            tool_calls = {
+                "snapshot": 1,
+                "memory_reads": 3,
+                "memory_writes": memory_update_count,
+                "act": 1,
+                "total": 5 + memory_update_count,
+            }
+            telemetry = rpc.call(
+                "record_model_telemetry",
+                {
+                    "prompt_hash": _sha256_text(prompt),
+                    "response_hash": _sha256_json(completion.raw_response),
+                    "input_tokens": completion.input_tokens,
+                    "output_tokens": completion.output_tokens,
+                    "tool_calls": tool_calls,
+                    "model_calls": 1,
+                },
+            )
             append_decision_log(
                 config.decision_log,
                 {
@@ -374,6 +462,16 @@ def run(config: OrchestratorConfig) -> int:
                     "step": step,
                     "action_ref": action_ref,
                     "decision": decision,
+                    "validation_error": validation_error,
+                    "usage": {
+                        "input_tokens": completion.input_tokens,
+                        "output_tokens": completion.output_tokens,
+                        "total_tokens": completion.total_tokens,
+                    },
+                    "prompt_hash": _sha256_text(prompt),
+                    "response_hash": _sha256_json(completion.raw_response),
+                    "tool_calls": tool_calls,
+                    "telemetry": telemetry,
                     "result_summary": _result_summary(result),
                 },
             )
@@ -390,9 +488,12 @@ def _result_summary(result: Any) -> JsonDict:
         state = {}
     return {
         "action": result.get("action"),
-        "status": result.get("result", {}).get("status")
-        if isinstance(result.get("result"), dict)
-        else None,
+        "status": (
+            result.get("result", {}).get("status")
+            if isinstance(result.get("result"), dict)
+            else result.get("status")
+        ),
+        "error": result.get("error"),
         "state_type": state.get("state_type"),
         "menu_screen": state.get("menu_screen"),
         "actions_count": len(result.get("actions") or []),

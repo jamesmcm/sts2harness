@@ -57,7 +57,9 @@ def load_config(path: str | Path) -> CliOrchestratorConfig:
     )
 
 
-def run_json(command: list[str], *, cwd: str | None = None, timeout: float = 60.0) -> JsonDict:
+def run_json(
+    command: list[str], *, cwd: str | None = None, timeout: float = 60.0
+) -> JsonDict:
     result = subprocess.run(
         command,
         cwd=cwd,
@@ -116,7 +118,9 @@ def run(config: CliOrchestratorConfig) -> int:
     Path(config.workspace).mkdir(parents=True, exist_ok=True)
     for iteration in range(config.max_iterations):
         before = snapshot(config)
-        before_state = before.get("state") if isinstance(before.get("state"), dict) else {}
+        before_state = (
+            before.get("state") if isinstance(before.get("state"), dict) else {}
+        )
         if config.stop_on_game_over and before_state.get("state_type") == "game_over":
             append_log(
                 config.log_path,

@@ -157,9 +157,7 @@ class ActionGenerationTests(unittest.TestCase):
                 "potions": [{"slot": 0, "name": "Fire Potion"}],
             },
             "rewards": {
-                "items": [
-                    {"index": 0, "type": "potion", "potion_name": "Dex Potion"}
-                ]
+                "items": [{"index": 0, "type": "potion", "potion_name": "Dex Potion"}]
             },
         }
 
@@ -198,12 +196,7 @@ class ProgressTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             progress_file = str(Path(tmpdir) / "progress.json")
             history = (
-                Path(tmpdir)
-                / "steamid"
-                / "modded"
-                / "profile1"
-                / "saves"
-                / "history"
+                Path(tmpdir) / "steamid" / "modded" / "profile1" / "saves" / "history"
             )
             history.mkdir(parents=True)
             history_file = history / "run1.run"
@@ -358,7 +351,9 @@ class CurrentRunVerificationTests(unittest.TestCase):
 class MemoryCommitTests(unittest.TestCase):
     def test_commit_memory_snapshot_commits_only_configured_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            subprocess.run(["git", "init"], cwd=tmpdir, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "init"], cwd=tmpdir, check=True, stdout=subprocess.PIPE
+            )
             subprocess.run(
                 ["git", "config", "user.email", "test@example.invalid"],
                 cwd=tmpdir,
@@ -451,6 +446,125 @@ class InvalidActionLoggingTests(unittest.TestCase):
             self.assertEqual(run_row[0], 1)
             self.assertEqual(step_row[0], "invalid_agent")
             self.assertIn("play_card:7", step_row[1])
+
+
+class ModelTelemetryLoggingTests(unittest.TestCase):
+    def test_record_model_telemetry_updates_latest_agent_step_and_run_totals(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                ),
+            )
+            state = {
+                "state_type": "monster",
+                "floor": 3,
+                "player": {"hp": 10, "max_hp": 80, "gold": 5},
+            }
+            action = main.Action(
+                id="end_turn",
+                label="End turn",
+                category="combat",
+                request={"action": "end_turn"},
+            )
+            start = main.start_logged_run(config, state, None)
+            main.log_step(config, state, [action], action, action_source="agent")
+
+            result = main.record_model_telemetry(
+                config,
+                prompt_hash="prompt-hash",
+                response_hash="response-hash",
+                input_tokens=123,
+                output_tokens=45,
+                tool_calls={
+                    "snapshot": 1,
+                    "memory_reads": 3,
+                    "memory_writes": 2,
+                    "act": 1,
+                },
+            )
+
+            self.assertEqual(result["status"], "recorded")
+            conn = sqlite3.connect(sqlite_path)
+            run_row = conn.execute(
+                """
+                SELECT total_model_calls, total_input_tokens, total_output_tokens,
+                       total_tool_calls
+                FROM runs WHERE run_id = ?
+                """,
+                (start["run_id"],),
+            ).fetchone()
+            step_row = conn.execute(
+                """
+                SELECT prompt_hash, response_hash, tool_calls
+                FROM steps WHERE run_id = ?
+                """,
+                (start["run_id"],),
+            ).fetchone()
+            conn.close()
+
+            self.assertEqual(run_row, (1, 123, 45, 7))
+            self.assertEqual(step_row[0], "prompt-hash")
+            self.assertEqual(step_row[1], "response-hash")
+            self.assertIn('"memory_writes": 2', step_row[2])
+
+    def test_record_model_telemetry_can_attach_to_invalid_agent_step(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                ),
+            )
+            state = {"state_type": "map"}
+            start = main.start_logged_run(config, state, None)
+            main.log_invalid_action(config, state, [], "bad_action", "not legal")
+
+            result = main.record_model_telemetry(
+                config,
+                prompt_hash="prompt-hash",
+                response_hash="response-hash",
+                input_tokens=10,
+                output_tokens=4,
+                tool_calls={"total": 5},
+            )
+
+            self.assertEqual(result["status"], "recorded")
+            conn = sqlite3.connect(sqlite_path)
+            row = conn.execute(
+                """
+                SELECT action_source, prompt_hash, response_hash
+                FROM steps WHERE run_id = ?
+                """,
+                (start["run_id"],),
+            ).fetchone()
+            conn.close()
+            self.assertEqual(row, ("invalid_agent", "prompt-hash", "response-hash"))
 
 
 if __name__ == "__main__":

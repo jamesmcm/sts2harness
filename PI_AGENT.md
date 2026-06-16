@@ -130,6 +130,8 @@ Example memory write:
 - `read_memory`: reads one memory file under `memory_root`.
 - `write_memory`: replaces one memory file under `memory_root`.
 - `append_memory`: appends to one memory file under `memory_root`.
+- `record_model_telemetry`: records Pi orchestrator prompt/response hashes,
+  token usage, and RPC tool-call counts against the latest logged agent step.
 
 Memory paths are resolved under `memory_root`; `../` escapes are rejected.
 
@@ -159,10 +161,18 @@ The orchestrator loop is:
 5. Validate that the action is still legal.
 6. Apply memory updates.
 7. Call `act`.
-8. Append a compact decision record to `decision_log`.
+8. Record model telemetry in the harness SQLite database when official logging
+   is active.
+9. Append a compact decision record to `decision_log`.
 
 `act` always returns a fresh post-action state/actions payload because allowing
 blind follow-up commands makes stale action queues too easy.
+
+The current Pi loop does not summarize context or spawn subagents. It passes
+the full snapshot plus the full contents of `STRATEGY.md`, `CURRENT_RUN.md`,
+and `BATTLE_LOG.md` into each decision prompt, then applies any memory updates
+the model returns. A summarizing/subagent Pi condition should be implemented as
+a separate orchestrator variant so it can be measured as an ablation.
 
 ### OpenAI / ChatGPT
 
@@ -295,7 +305,6 @@ config and write access to progress/logs, while the agent process does not.
 ## Current Limitations
 
 The RPC server exposes harness/game actions and memory file tools. It does not
-call an LLM itself, collect token usage, or decide strategy. The external Pi
-orchestrator is still responsible for model calls, prompt construction, tool
-policy, run scheduling, and writing token/model-call counts into the database in
-a later integration.
+call an LLM itself or decide strategy. The external Pi orchestrator is still
+responsible for model calls, prompt construction, tool policy, run scheduling,
+and reporting telemetry back to the harness.

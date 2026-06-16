@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass
@@ -73,6 +72,7 @@ class PiRpcServer:
             "read_memory": self.read_memory,
             "write_memory": self.write_memory,
             "append_memory": self.append_memory,
+            "record_model_telemetry": self.record_model_telemetry,
         }
         handler = methods.get(method)
         if handler is None:
@@ -132,11 +132,32 @@ class PiRpcServer:
             self.client, before, self.harness_config
         )
         actions = harness.build_actions(before, self.harness_config.run_setup)
-        action = harness.find_action(actions, action_ref)
-        start_action = (
-            action.request.get("action") == "menu_select"
-            and str(action.request.get("option") or "").lower() in {"confirm", "embark"}
-        )
+        try:
+            action = harness.find_action(actions, action_ref)
+        except ValueError as exc:
+            error = str(exc)
+            harness.log_invalid_action(
+                self.harness_config, before, actions, action_ref, error
+            )
+            output: JsonDict = {
+                "status": "error",
+                "error": error,
+                "action_ref": action_ref,
+                "state": before,
+                "actions": harness.action_dicts(actions),
+            }
+            if pre_auto_actions:
+                output["pre_auto_actions"] = pre_auto_actions
+            progress_update = harness.maybe_update_progress_after_state(
+                self.client, before, self.harness_config.run_setup
+            )
+            if progress_update is not None:
+                output["progress_update"] = progress_update
+            harness.finalize_logged_run(self.harness_config, before)
+            return output
+        start_action = action.request.get("action") == "menu_select" and str(
+            action.request.get("option") or ""
+        ).lower() in {"confirm", "embark"}
         if not start_action:
             harness.log_step(
                 self.harness_config, before, actions, action, action_source="agent"
@@ -172,7 +193,9 @@ class PiRpcServer:
         )
         if verification is not None:
             output["run_setup_verification"] = verification
-            log_start = harness.start_logged_run(self.harness_config, after, verification)
+            log_start = harness.start_logged_run(
+                self.harness_config, after, verification
+            )
             if log_start is not None:
                 output["run_log"] = log_start
                 harness.log_step(
@@ -198,7 +221,10 @@ class PiRpcServer:
     def read_memory(self, params: JsonDict) -> JsonDict:
         path = self._safe_path(str(params["path"]))
         with open(path, "r", encoding="utf-8") as handle:
-            return {"path": str(path.relative_to(self.memory_root)), "content": handle.read()}
+            return {
+                "path": str(path.relative_to(self.memory_root)),
+                "content": handle.read(),
+            }
 
     def write_memory(self, params: JsonDict) -> JsonDict:
         path = self._safe_path(str(params["path"]))
@@ -216,6 +242,20 @@ class PiRpcServer:
             handle.write(content)
         return {"status": "ok", "path": str(path.relative_to(self.memory_root))}
 
+    def record_model_telemetry(self, params: JsonDict) -> JsonDict:
+        tool_calls = params.get("tool_calls")
+        if tool_calls is not None and not isinstance(tool_calls, (dict, list)):
+            raise ValueError("tool_calls must be an object or array")
+        return harness.record_model_telemetry(
+            self.harness_config,
+            prompt_hash=_optional_str(params.get("prompt_hash")),
+            response_hash=_optional_str(params.get("response_hash")),
+            input_tokens=_optional_int(params.get("input_tokens")),
+            output_tokens=_optional_int(params.get("output_tokens")),
+            tool_calls=tool_calls,
+            model_calls=int(params.get("model_calls", 1)),
+        )
+
     def _safe_path(self, relative: str) -> Path:
         path = (self.memory_root / relative).resolve()
         try:
@@ -225,7 +265,24 @@ class PiRpcServer:
         return path
 
 
-def _response(request_id: Any, result: Any = None, error: str | None = None) -> JsonDict:
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid integer")
+    return int(value)
+
+
+def _response(
+    request_id: Any, result: Any = None, error: str | None = None
+) -> JsonDict:
     response: JsonDict = {"jsonrpc": "2.0", "id": request_id}
     if error is None:
         response["result"] = result
@@ -248,7 +305,10 @@ def serve(config_path: str) -> int:
             if not isinstance(params, dict):
                 raise ValueError("params must be an object")
             result = server.dispatch(method, params)
-            print(json.dumps(_response(request_id, result), ensure_ascii=False), flush=True)
+            print(
+                json.dumps(_response(request_id, result), ensure_ascii=False),
+                flush=True,
+            )
         except Exception as exc:
             request_id = None
             try:

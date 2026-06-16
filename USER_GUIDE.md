@@ -190,14 +190,17 @@ The run ID includes agent, condition, seed, ascension, and run start time. The
 database contains:
 
 - `runs`: one row per official run, including seed, ascension, model, condition,
-  character, final floor, victory, and aggregate action counts.
+  character, final floor, victory, aggregate action counts, and Pi orchestrator
+  model/token/tool-call totals when available.
 - `steps`: one row per logged agent or auto action, including state stats,
-  legal actions, chosen action, action source, and observation hash.
+  legal actions, chosen action, action source, observation hash, and Pi
+  orchestrator prompt/response hashes when available.
 - `run_summaries`: reserved for later agent/harness summaries and memory diffs.
 
-Model calls, token counts, tool counts, prompt hashes, and response hashes are
-columns in the schema but need the external agent/orchestrator to provide them
-in a later integration.
+For Pi orchestrator runs, model calls, input/output tokens, prompt hashes,
+response hashes, and RPC tool-call counts are recorded after each agent action.
+For CLI-agent runs, those fields still require the CLI wrapper or external
+agent to report telemetry.
 
 ## Pi Agent Library Use
 

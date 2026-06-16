@@ -29,7 +29,12 @@
     "sqlite_path": "/var/lib/sts2harness/official/sts2-runs.sqlite",
     "harness_version": "sts2harness-2026-06-06",
     "memory_git_dir": "/var/lib/sts2harness/official/agent-worktree",
+    "memory_git_source": "/var/lib/sts2harness/official/agent-memory.git",
+    "memory_git_branch": "memory/pi-agent-custom-pi-memory-context",
+    "memory_git_init": true,
     "memory_commit_on_run_start": true,
+    "memory_commit_on_room_change": true,
+    "memory_commit_on_run_end": true,
     "memory_commit_paths": [
       "STRATEGY.md",
       "CURRENT_RUN.md",

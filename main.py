@@ -62,7 +62,12 @@ class LoggingConfig:
     harness_version: str | None = None
     git_commit: str | None = None
     memory_git_dir: str | None = None
+    memory_git_source: str | None = None
+    memory_git_branch: str | None = None
+    memory_git_init: bool = False
     memory_commit_on_run_start: bool = False
+    memory_commit_on_room_change: bool = False
+    memory_commit_on_run_end: bool = False
     memory_commit_paths: tuple[str, ...] = ()
 
 
@@ -376,8 +381,17 @@ def load_harness_config(config_path: str) -> HarnessConfig:
             harness_version=_optional_str(logging_config.get("harness_version")),
             git_commit=_optional_str(logging_config.get("git_commit")),
             memory_git_dir=_optional_str(logging_config.get("memory_git_dir")),
+            memory_git_source=_optional_str(logging_config.get("memory_git_source")),
+            memory_git_branch=_optional_str(logging_config.get("memory_git_branch")),
+            memory_git_init=bool(logging_config.get("memory_git_init")),
             memory_commit_on_run_start=bool(
                 logging_config.get("memory_commit_on_run_start")
+            ),
+            memory_commit_on_room_change=bool(
+                logging_config.get("memory_commit_on_room_change")
+            ),
+            memory_commit_on_run_end=bool(
+                logging_config.get("memory_commit_on_run_end")
             ),
             memory_commit_paths=_string_tuple(
                 logging_config.get("memory_commit_paths")
@@ -1622,6 +1636,11 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
           total_input_tokens INTEGER,
           total_output_tokens INTEGER,
           total_tool_calls INTEGER,
+          total_cost REAL,
+          total_prompt_cost REAL,
+          total_completion_cost REAL,
+          total_native_tokens_prompt INTEGER,
+          total_native_tokens_completion INTEGER,
           invalid_action_count INTEGER DEFAULT 0,
           harness_observations INTEGER DEFAULT 0,
           agent_actions INTEGER DEFAULT 0,
@@ -1646,6 +1665,22 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
           observation_hash TEXT,
           prompt_hash TEXT,
           response_hash TEXT,
+          prompt_text TEXT,
+          response_text TEXT,
+          raw_response_json TEXT,
+          request_json TEXT,
+          provider_name TEXT,
+          request_id TEXT,
+          response_id TEXT,
+          generation_id TEXT,
+          upstream_id TEXT,
+          total_cost REAL,
+          prompt_cost REAL,
+          completion_cost REAL,
+          native_tokens_prompt INTEGER,
+          native_tokens_completion INTEGER,
+          generation_stats_json TEXT,
+          generation_content_json TEXT,
           tool_calls TEXT,
           timestamp TEXT NOT NULL
         );
@@ -1660,7 +1695,52 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _ensure_columns(
+        conn,
+        "runs",
+        {
+            "total_cost": "REAL",
+            "total_prompt_cost": "REAL",
+            "total_completion_cost": "REAL",
+            "total_native_tokens_prompt": "INTEGER",
+            "total_native_tokens_completion": "INTEGER",
+        },
+    )
+    _ensure_columns(
+        conn,
+        "steps",
+        {
+            "prompt_text": "TEXT",
+            "response_text": "TEXT",
+            "raw_response_json": "TEXT",
+            "request_json": "TEXT",
+            "provider_name": "TEXT",
+            "request_id": "TEXT",
+            "response_id": "TEXT",
+            "generation_id": "TEXT",
+            "upstream_id": "TEXT",
+            "total_cost": "REAL",
+            "prompt_cost": "REAL",
+            "completion_cost": "REAL",
+            "native_tokens_prompt": "INTEGER",
+            "native_tokens_completion": "INTEGER",
+            "generation_stats_json": "TEXT",
+            "generation_content_json": "TEXT",
+        },
+    )
     conn.commit()
+
+
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    existing = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _run_id(config: HarnessConfig, verification: JsonDict | None = None) -> str:
@@ -1748,28 +1828,138 @@ def _set_progress_current_run_id(config: HarnessConfig, run_id: str) -> None:
     _write_json_file(config.run_setup.progress_file, progress)
 
 
-def commit_memory_snapshot(config: HarnessConfig, run_id: str) -> JsonDict | None:
-    if not config.logging.memory_commit_on_run_start:
-        return None
+def ensure_memory_git_worktree(config: HarnessConfig) -> JsonDict | None:
     if not config.logging.memory_git_dir:
         return {"status": "skipped", "reason": "memory_git_dir_not_configured"}
+
+    git_dir = os.path.expanduser(config.logging.memory_git_dir)
+    if _is_git_worktree(git_dir):
+        return {"status": "ok", "git_dir": git_dir}
+
+    source = config.logging.memory_git_source
+    if source:
+        source_dir = os.path.expanduser(source)
+        if not _is_git_worktree(source_dir):
+            if not config.logging.memory_git_init:
+                return {
+                    "status": "error",
+                    "reason": "memory_git_source_not_a_repo",
+                    "source": source_dir,
+                }
+            os.makedirs(source_dir, exist_ok=True)
+            init_result = _run_git(["init"], cwd=source_dir)
+            if init_result.returncode != 0:
+                return {
+                    "status": "error",
+                    "reason": "git_init_source_failed",
+                    "stderr": init_result.stderr.strip(),
+                }
+            empty_commit = _run_git(
+                ["commit", "--allow-empty", "-m", "initial memory repo"],
+                cwd=source_dir,
+            )
+            if empty_commit.returncode != 0:
+                return {
+                    "status": "error",
+                    "reason": "git_initial_commit_failed",
+                    "stderr": empty_commit.stderr.strip(),
+                }
+
+        branch = config.logging.memory_git_branch or _default_memory_branch(config)
+        git_parent = os.path.dirname(git_dir)
+        if git_parent:
+            os.makedirs(git_parent, exist_ok=True)
+        worktree_result = _run_git(
+            ["worktree", "add", "-B", branch, git_dir],
+            cwd=source_dir,
+        )
+        if worktree_result.returncode != 0 and not _is_git_worktree(git_dir):
+            return {
+                "status": "error",
+                "reason": "git_worktree_add_failed",
+                "stderr": worktree_result.stderr.strip(),
+                "source": source_dir,
+                "git_dir": git_dir,
+                "branch": branch,
+            }
+        return {
+            "status": "created",
+            "source": source_dir,
+            "git_dir": git_dir,
+            "branch": branch,
+        }
+
+    if config.logging.memory_git_init:
+        os.makedirs(git_dir, exist_ok=True)
+        init_result = _run_git(["init"], cwd=git_dir)
+        if init_result.returncode != 0:
+            return {
+                "status": "error",
+                "reason": "git_init_failed",
+                "stderr": init_result.stderr.strip(),
+            }
+        return {"status": "created", "git_dir": git_dir}
+
+    return {
+        "status": "error",
+        "reason": "memory_git_dir_not_a_repo",
+        "git_dir": git_dir,
+    }
+
+
+def _is_git_worktree(path: str) -> bool:
+    return (
+        os.path.isdir(path)
+        and _run_git(["rev-parse", "--is-inside-work-tree"], cwd=path).returncode == 0
+    )
+
+
+def _default_memory_branch(config: HarnessConfig) -> str:
+    parts = [
+        config.agent.agent_name or "agent",
+        config.agent.condition_name or "condition",
+        config.agent.model_name or "model",
+    ]
+    return "memory/" + "-".join(_slug(part) for part in parts)
+
+
+def _run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("GIT_AUTHOR_NAME", "sts2harness")
+    env.setdefault("GIT_AUTHOR_EMAIL", "sts2harness@example.invalid")
+    env.setdefault("GIT_COMMITTER_NAME", "sts2harness")
+    env.setdefault("GIT_COMMITTER_EMAIL", "sts2harness@example.invalid")
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def commit_memory_snapshot(
+    config: HarnessConfig,
+    run_id: str,
+    *,
+    reason: str = "checkpoint",
+    message: str | None = None,
+) -> JsonDict | None:
+    if not config.logging.memory_git_dir:
+        return {"status": "skipped", "reason": "memory_git_dir_not_configured"}
+
+    git_ready = ensure_memory_git_worktree(config)
+    if git_ready is not None and git_ready.get("status") == "error":
+        return git_ready
 
     git_dir = os.path.expanduser(config.logging.memory_git_dir)
     paths = config.logging.memory_commit_paths
     if not paths:
         return {"status": "skipped", "reason": "no_memory_commit_paths"}
 
-    def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *args],
-            cwd=git_dir,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-
-    add_result = run_git(["add", "-f", "--", *paths])
+    add_result = _run_git(["add", "-f", "--", *paths], cwd=git_dir)
     if add_result.returncode != 0:
         return {
             "status": "error",
@@ -1777,9 +1967,9 @@ def commit_memory_snapshot(config: HarnessConfig, run_id: str) -> JsonDict | Non
             "stderr": add_result.stderr.strip(),
         }
 
-    diff_result = run_git(["diff", "--cached", "--quiet", "--", *paths])
+    diff_result = _run_git(["diff", "--cached", "--quiet", "--", *paths], cwd=git_dir)
     if diff_result.returncode == 0:
-        return {"status": "unchanged"}
+        return {"status": "unchanged", "reason": reason}
     if diff_result.returncode != 1:
         return {
             "status": "error",
@@ -1787,8 +1977,9 @@ def commit_memory_snapshot(config: HarnessConfig, run_id: str) -> JsonDict | Non
             "stderr": diff_result.stderr.strip(),
         }
 
-    message = f"memory snapshot at run start {run_id}"
-    commit_result = run_git(["commit", "-m", message, "--", *paths])
+    if message is None:
+        message = f"memory {reason} {run_id}"
+    commit_result = _run_git(["commit", "-m", message, "--", *paths], cwd=git_dir)
     if commit_result.returncode != 0:
         return {
             "status": "error",
@@ -1796,12 +1987,67 @@ def commit_memory_snapshot(config: HarnessConfig, run_id: str) -> JsonDict | Non
             "stderr": commit_result.stderr.strip(),
         }
 
-    rev_result = run_git(["rev-parse", "--short", "HEAD"])
+    rev_result = _run_git(["rev-parse", "--short", "HEAD"], cwd=git_dir)
     return {
         "status": "committed",
+        "reason": reason,
         "commit": rev_result.stdout.strip() if rev_result.returncode == 0 else None,
         "message": message,
     }
+
+
+def maybe_commit_memory_checkpoint(
+    config: HarnessConfig,
+    state: JsonDict,
+    *,
+    reason: str,
+    force: bool = False,
+) -> JsonDict | None:
+    if reason == "room" and not config.logging.memory_commit_on_room_change:
+        return None
+    if reason == "run_end" and not config.logging.memory_commit_on_run_end:
+        return None
+    run_id = _progress_current_run_id(config)
+    if run_id is None:
+        return None
+
+    key = _memory_checkpoint_key(state, reason)
+    progress = _load_json_file(config.run_setup.progress_file)
+    progress_field = f"last_memory_{reason}_commit_key"
+    if not force and key is not None and progress.get(progress_field) == key:
+        return {"status": "skipped", "reason": "already_committed", "key": key}
+
+    message = _memory_checkpoint_message(run_id, state, reason)
+    result = commit_memory_snapshot(
+        config, run_id, reason=reason, message=message
+    )
+    if result is not None and result.get("status") in {"committed", "unchanged"}:
+        progress[progress_field] = key
+        progress[f"last_memory_{reason}_commit_status"] = result.get("status")
+        if result.get("commit"):
+            progress[f"last_memory_{reason}_commit"] = result.get("commit")
+        _write_json_file(config.run_setup.progress_file, progress)
+    return result
+
+
+def _memory_checkpoint_key(state: JsonDict, reason: str) -> str | None:
+    if reason == "run_end":
+        return f"run_end:{_state_act(state)}:{_state_floor(state)}"
+    floor = _state_floor(state)
+    if floor is None or floor <= 0:
+        return None
+    return f"room:{_state_act(state)}:{floor}"
+
+
+def _memory_checkpoint_message(run_id: str, state: JsonDict, reason: str) -> str:
+    floor = _state_floor(state)
+    act = _state_act(state)
+    room_type = _state_room_type(state) or state.get("state_type") or "unknown"
+    if reason == "run_end":
+        return f"memory run-end snapshot {run_id}"
+    if reason == "room":
+        return f"memory room checkpoint {run_id} act {act} floor {floor} {room_type}"
+    return f"memory checkpoint {reason} {run_id}"
 
 
 def start_logged_run(
@@ -1844,9 +2090,15 @@ def start_logged_run(
     conn.close()
     _set_progress_current_run_id(config, run_id)
     result: JsonDict = {"status": "started", "run_id": run_id}
-    memory_commit = commit_memory_snapshot(config, run_id)
-    if memory_commit is not None:
-        result["memory_commit"] = memory_commit
+    if config.logging.memory_commit_on_run_start:
+        memory_commit = commit_memory_snapshot(
+            config,
+            run_id,
+            reason="run_start",
+            message=f"memory run-start snapshot {run_id}",
+        )
+        if memory_commit is not None:
+            result["memory_commit"] = memory_commit
     return result
 
 
@@ -1990,6 +2242,22 @@ def record_model_telemetry(
     *,
     prompt_hash: str | None = None,
     response_hash: str | None = None,
+    prompt_text: str | None = None,
+    response_text: str | None = None,
+    raw_response: JsonDict | None = None,
+    request_payload: JsonDict | None = None,
+    provider_name: str | None = None,
+    request_id: str | None = None,
+    response_id: str | None = None,
+    generation_id: str | None = None,
+    upstream_id: str | None = None,
+    total_cost: float | None = None,
+    prompt_cost: float | None = None,
+    completion_cost: float | None = None,
+    native_tokens_prompt: int | None = None,
+    native_tokens_completion: int | None = None,
+    generation_stats: JsonDict | None = None,
+    generation_content: JsonDict | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     tool_calls: JsonDict | list[Any] | None = None,
@@ -2025,10 +2293,47 @@ def record_model_telemetry(
         UPDATE steps
         SET prompt_hash = COALESCE(?, prompt_hash),
             response_hash = COALESCE(?, response_hash),
+            prompt_text = COALESCE(?, prompt_text),
+            response_text = COALESCE(?, response_text),
+            raw_response_json = COALESCE(?, raw_response_json),
+            request_json = COALESCE(?, request_json),
+            provider_name = COALESCE(?, provider_name),
+            request_id = COALESCE(?, request_id),
+            response_id = COALESCE(?, response_id),
+            generation_id = COALESCE(?, generation_id),
+            upstream_id = COALESCE(?, upstream_id),
+            total_cost = COALESCE(?, total_cost),
+            prompt_cost = COALESCE(?, prompt_cost),
+            completion_cost = COALESCE(?, completion_cost),
+            native_tokens_prompt = COALESCE(?, native_tokens_prompt),
+            native_tokens_completion = COALESCE(?, native_tokens_completion),
+            generation_stats_json = COALESCE(?, generation_stats_json),
+            generation_content_json = COALESCE(?, generation_content_json),
             tool_calls = COALESCE(?, tool_calls)
         WHERE id = ?
         """,
-        (prompt_hash, response_hash, tool_calls_json, row[0]),
+        (
+            prompt_hash,
+            response_hash,
+            prompt_text,
+            response_text,
+            _json_or_none(raw_response),
+            _json_or_none(request_payload),
+            provider_name,
+            request_id,
+            response_id,
+            generation_id,
+            upstream_id,
+            total_cost,
+            prompt_cost,
+            completion_cost,
+            native_tokens_prompt,
+            native_tokens_completion,
+            _json_or_none(generation_stats),
+            _json_or_none(generation_content),
+            tool_calls_json,
+            row[0],
+        ),
     )
 
     tool_count = _tool_call_count(tool_calls)
@@ -2038,7 +2343,12 @@ def record_model_telemetry(
         SET total_model_calls = COALESCE(total_model_calls, 0) + ?,
             total_input_tokens = COALESCE(total_input_tokens, 0) + ?,
             total_output_tokens = COALESCE(total_output_tokens, 0) + ?,
-            total_tool_calls = COALESCE(total_tool_calls, 0) + ?
+            total_tool_calls = COALESCE(total_tool_calls, 0) + ?,
+            total_cost = COALESCE(total_cost, 0) + ?,
+            total_prompt_cost = COALESCE(total_prompt_cost, 0) + ?,
+            total_completion_cost = COALESCE(total_completion_cost, 0) + ?,
+            total_native_tokens_prompt = COALESCE(total_native_tokens_prompt, 0) + ?,
+            total_native_tokens_completion = COALESCE(total_native_tokens_completion, 0) + ?
         WHERE run_id = ?
         """,
         (
@@ -2046,6 +2356,11 @@ def record_model_telemetry(
             max(0, int(input_tokens or 0)),
             max(0, int(output_tokens or 0)),
             tool_count,
+            float(total_cost or 0.0),
+            float(prompt_cost or 0.0),
+            float(completion_cost or 0.0),
+            max(0, int(native_tokens_prompt or 0)),
+            max(0, int(native_tokens_completion or 0)),
             run_id,
         ),
     )
@@ -2057,8 +2372,15 @@ def record_model_telemetry(
         "step_id": row[0],
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "total_cost": total_cost,
         "tool_calls": tool_count,
     }
+
+
+def _json_or_none(value: JsonDict | list[Any] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, sort_keys=True, default=str)
 
 
 def _tool_call_count(tool_calls: JsonDict | list[Any] | None) -> int:
@@ -2236,6 +2558,12 @@ def command_snapshot(args: argparse.Namespace) -> int:
     if progress_update is not None:
         output["progress_update"] = progress_update
     finalize_logged_run(config, state)
+    if state.get("state_type") == "game_over":
+        memory_commit = maybe_commit_memory_checkpoint(
+            config, state, reason="run_end"
+        )
+        if memory_commit is not None:
+            output["memory_commit"] = memory_commit
     print_json(output)
     return 0
 
@@ -2266,6 +2594,12 @@ def command_act(args: argparse.Namespace) -> int:
         if progress_update is not None:
             output["progress_update"] = progress_update
         finalize_logged_run(config, before)
+        if before.get("state_type") == "game_over":
+            memory_commit = maybe_commit_memory_checkpoint(
+                config, before, reason="run_end"
+            )
+            if memory_commit is not None:
+                output["memory_commit"] = memory_commit
         print_json(output)
         return 1
     start_action = action.request.get("action") == "menu_select" and str(
@@ -2306,6 +2640,13 @@ def command_act(args: argparse.Namespace) -> int:
             if progress_update is not None:
                 output["progress_update"] = progress_update
             finalize_logged_run(config, after)
+            memory_commit = maybe_commit_memory_checkpoint(
+                config,
+                after,
+                reason="run_end" if after.get("state_type") == "game_over" else "room",
+            )
+            if memory_commit is not None:
+                output["memory_commit"] = memory_commit
             verification = verify_started_run_setup(action, config.run_setup)
             if verification is not None:
                 output["run_setup_verification"] = verification
@@ -2338,6 +2679,13 @@ def command_act(args: argparse.Namespace) -> int:
     if progress_update is not None:
         output["progress_update"] = progress_update
     finalize_logged_run(config, after)
+    memory_commit = maybe_commit_memory_checkpoint(
+        config,
+        after,
+        reason="run_end" if after.get("state_type") == "game_over" else "room",
+    )
+    if memory_commit is not None:
+        output["memory_commit"] = memory_commit
     verification = verify_started_run_setup(action, config.run_setup)
     if verification is not None:
         output["run_setup_verification"] = verification

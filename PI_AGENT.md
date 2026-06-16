@@ -118,6 +118,25 @@ Example memory write:
 {"jsonrpc":"2.0","id":3,"method":"append_memory","params":{"path":"BATTLE_LOG.md","content":"\nFloor 3: took 2 damage, added Strike+.\n"}}
 ```
 
+## Memory Git Worktrees
+
+For official runs, put the memory files in a git worktree owned by the trusted
+harness/RPC user. Configure:
+
+- `logging.memory_git_source`: the source memory repository.
+- `logging.memory_git_dir`: the per-condition worktree containing
+  `STRATEGY.md`, `CURRENT_RUN.md`, and `BATTLE_LOG.md`.
+- `logging.memory_git_branch`: a stable branch name for this condition.
+- `logging.memory_git_init`: whether the harness may initialize the source repo
+  if it does not exist.
+- `logging.memory_commit_on_run_start`: commit a baseline snapshot when the run
+  is logged.
+- `logging.memory_commit_on_room_change`: commit once per floor/room checkpoint.
+- `logging.memory_commit_on_run_end`: commit the final run-end memory snapshot.
+
+The model does not run git. It only edits memory files through RPC. The harness
+commits the configured paths from the trusted side.
+
 ## RPC Methods
 
 - `ping`: health check.
@@ -131,7 +150,8 @@ Example memory write:
 - `write_memory`: replaces one memory file under `memory_root`.
 - `append_memory`: appends to one memory file under `memory_root`.
 - `record_model_telemetry`: records Pi orchestrator prompt/response hashes,
-  token usage, and RPC tool-call counts against the latest logged agent step.
+  full prompt/response payloads, token usage, request/response IDs, pricing
+  metadata, and RPC tool-call counts against the latest logged agent step.
 
 Memory paths are resolved under `memory_root`; `../` escapes are rejected.
 
@@ -163,7 +183,8 @@ The orchestrator loop is:
 7. Call `act`.
 8. Record model telemetry in the harness SQLite database when official logging
    is active.
-9. Append a compact decision record to `decision_log`.
+9. Commit memory checkpoints from the trusted harness side when configured.
+10. Append a compact decision record to `decision_log`.
 
 `act` always returns a fresh post-action state/actions payload because allowing
 blind follow-up commands makes stale action queues too easy.
@@ -173,6 +194,12 @@ the full snapshot plus the full contents of `STRATEGY.md`, `CURRENT_RUN.md`,
 and `BATTLE_LOG.md` into each decision prompt, then applies any memory updates
 the model returns. A summarizing/subagent Pi condition should be implemented as
 a separate orchestrator variant so it can be measured as an ablation.
+
+For OpenRouter providers, the orchestrator records the returned completion ID
+as the generation ID and queries `/api/v1/generation` plus
+`/api/v1/generation/content` for cost, request ID, upstream ID, native token
+counts, provider metadata, and stored prompt/completion content when OpenRouter
+has those records available.
 
 ### OpenAI / ChatGPT
 
@@ -281,6 +308,7 @@ The harness handles:
 - stop after three consecutive A10 wins
 - SQLite run/step logging for verified new official runs
 - trivial auto-resolve before observations reach the agent
+- git memory checkpoints at run start, room changes, and run end when enabled
 
 ## Giving Other Agents Harness Access
 

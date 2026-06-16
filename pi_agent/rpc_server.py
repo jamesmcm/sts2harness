@@ -121,6 +121,12 @@ class PiRpcServer:
         if progress_update is not None:
             output["progress_update"] = progress_update
         harness.finalize_logged_run(self.harness_config, state)
+        if state.get("state_type") == "game_over":
+            memory_commit = harness.maybe_commit_memory_checkpoint(
+                self.harness_config, state, reason="run_end"
+            )
+            if memory_commit is not None:
+                output["memory_commit"] = memory_commit
         return output
 
     def act(self, params: JsonDict) -> JsonDict:
@@ -154,6 +160,12 @@ class PiRpcServer:
             if progress_update is not None:
                 output["progress_update"] = progress_update
             harness.finalize_logged_run(self.harness_config, before)
+            if before.get("state_type") == "game_over":
+                memory_commit = harness.maybe_commit_memory_checkpoint(
+                    self.harness_config, before, reason="run_end"
+                )
+                if memory_commit is not None:
+                    output["memory_commit"] = memory_commit
             return output
         start_action = action.request.get("action") == "menu_select" and str(
             action.request.get("option") or ""
@@ -188,6 +200,13 @@ class PiRpcServer:
         if progress_update is not None:
             output["progress_update"] = progress_update
         harness.finalize_logged_run(self.harness_config, after)
+        memory_commit = harness.maybe_commit_memory_checkpoint(
+            self.harness_config,
+            after,
+            reason="run_end" if after.get("state_type") == "game_over" else "room",
+        )
+        if memory_commit is not None:
+            output["memory_commit"] = memory_commit
         verification = harness.verify_started_run_setup(
             action, self.harness_config.run_setup
         )
@@ -250,6 +269,24 @@ class PiRpcServer:
             self.harness_config,
             prompt_hash=_optional_str(params.get("prompt_hash")),
             response_hash=_optional_str(params.get("response_hash")),
+            prompt_text=_optional_str(params.get("prompt_text")),
+            response_text=_optional_str(params.get("response_text")),
+            raw_response=_optional_json_object(params.get("raw_response")),
+            request_payload=_optional_json_object(params.get("request_payload")),
+            provider_name=_optional_str(params.get("provider_name")),
+            request_id=_optional_str(params.get("request_id")),
+            response_id=_optional_str(params.get("response_id")),
+            generation_id=_optional_str(params.get("generation_id")),
+            upstream_id=_optional_str(params.get("upstream_id")),
+            total_cost=_optional_float(params.get("total_cost")),
+            prompt_cost=_optional_float(params.get("prompt_cost")),
+            completion_cost=_optional_float(params.get("completion_cost")),
+            native_tokens_prompt=_optional_int(params.get("native_tokens_prompt")),
+            native_tokens_completion=_optional_int(
+                params.get("native_tokens_completion")
+            ),
+            generation_stats=_optional_json_object(params.get("generation_stats")),
+            generation_content=_optional_json_object(params.get("generation_content")),
             input_tokens=_optional_int(params.get("input_tokens")),
             output_tokens=_optional_int(params.get("output_tokens")),
             tool_calls=tool_calls,
@@ -278,6 +315,22 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, bool):
         raise ValueError("Boolean is not a valid integer")
     return int(value)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Boolean is not a valid float")
+    return float(value)
+
+
+def _optional_json_object(value: Any) -> JsonDict | list[Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (dict, list)):
+        raise ValueError("Expected object or array JSON value")
+    return value
 
 
 def _response(

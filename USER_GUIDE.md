@@ -67,7 +67,12 @@ Example official-run config:
     "sqlite_path": "/var/lib/sts2harness/official/runs.sqlite",
     "harness_version": "sts2harness-2026-06-06",
     "memory_git_dir": "/var/lib/sts2harness/official/agent-worktree",
+    "memory_git_source": "/var/lib/sts2harness/official/agent-memory.git",
+    "memory_git_branch": "memory/codex-strong-prompt-memory-files",
+    "memory_git_init": true,
     "memory_commit_on_run_start": true,
+    "memory_commit_on_room_change": true,
+    "memory_commit_on_run_end": true,
     "memory_commit_paths": [
       "STRATEGY.md",
       "CURRENT_RUN.md",
@@ -105,9 +110,13 @@ Set `stop_after_current_run` to `true` when you want the current in-progress
 run to be the final run in the experiment; the harness marks progress stopped
 after the next `game_over` state.
 
-When `logging.memory_commit_on_run_start` is enabled, the harness commits the
-configured `memory_commit_paths` inside `memory_git_dir` when a new run is
-logged. Keep SQLite databases outside that git worktree.
+When `logging.memory_git_source` is set, the harness treats `memory_git_dir` as
+the condition worktree and creates it from that source repository if needed.
+Use one branch/worktree per agent condition. When
+`memory_commit_on_run_start`, `memory_commit_on_room_change`, or
+`memory_commit_on_run_end` are enabled, the harness commits the configured
+`memory_commit_paths` inside `memory_git_dir` at those checkpoints. Keep SQLite
+databases outside that git worktree.
 
 ## Running Agents
 
@@ -191,14 +200,22 @@ database contains:
 
 - `runs`: one row per official run, including seed, ascension, model, condition,
   character, final floor, victory, aggregate action counts, and Pi orchestrator
-  model/token/tool-call totals when available.
+  model/token/tool-call/cost totals when available.
 - `steps`: one row per logged agent or auto action, including state stats,
   legal actions, chosen action, action source, observation hash, and Pi
-  orchestrator prompt/response hashes when available.
+  orchestrator prompt/response hashes plus full prompt/response payloads when
+  available.
 - `run_summaries`: reserved for later agent/harness summaries and memory diffs.
 
-For Pi orchestrator runs, model calls, input/output tokens, prompt hashes,
-response hashes, and RPC tool-call counts are recorded after each agent action.
+For Pi orchestrator runs, model calls, input/output tokens, full prompt text,
+full response text, raw request/response JSON, prompt/response hashes, and RPC
+tool-call counts are recorded after each agent action.
+For OpenRouter runs, the orchestrator also records the response/generation ID
+and queries OpenRouter's generation endpoints for request ID, upstream ID,
+provider, native prompt/completion tokens, total cost, and stored
+prompt/completion content when available. `prompt_cost` and `completion_cost`
+are a proportional split from `total_cost` and native token counts when
+OpenRouter does not provide separate billed prompt/completion costs.
 For CLI-agent runs, those fields still require the CLI wrapper or external
 agent to report telemetry.
 

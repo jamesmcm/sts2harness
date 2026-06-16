@@ -395,6 +395,171 @@ class MemoryCommitTests(unittest.TestCase):
                 tracked, ["BATTLE_LOG.md", "CURRENT_RUN.md", "STRATEGY.md"]
             )
 
+    def test_ensure_memory_git_worktree_adds_condition_worktree(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "memory-source"
+            worktree = Path(tmpdir) / "condition-worktree"
+            source.mkdir()
+            subprocess.run(["git", "init"], cwd=source, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "-m", "initial memory repo"],
+                cwd=source,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(),
+                agent=main.AgentConfig(
+                    agent_name="pi-agent",
+                    model_name="model",
+                    condition_name="memory",
+                ),
+                logging=main.LoggingConfig(
+                    memory_git_source=str(source),
+                    memory_git_dir=str(worktree),
+                    memory_git_branch="memory/test-condition",
+                ),
+            )
+
+            result = main.ensure_memory_git_worktree(config)
+
+            self.assertEqual(result["status"], "created")
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=worktree,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(branch, "memory/test-condition")
+
+    def test_room_checkpoint_commits_once_per_floor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=tmpdir,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=tmpdir,
+                check=True,
+            )
+            Path(tmpdir, "STRATEGY.md").write_text("initial\n", encoding="utf-8")
+            Path(tmpdir, "CURRENT_RUN.md").write_text("run\n", encoding="utf-8")
+            Path(tmpdir, "BATTLE_LOG.md").write_text("log\n", encoding="utf-8")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                    memory_git_dir=tmpdir,
+                    memory_commit_on_room_change=True,
+                    memory_commit_paths=(
+                        "STRATEGY.md",
+                        "CURRENT_RUN.md",
+                        "BATTLE_LOG.md",
+                    ),
+                ),
+            )
+            main.start_logged_run(config, {"state_type": "monster"}, None)
+
+            first = main.maybe_commit_memory_checkpoint(
+                config, {"state_type": "monster", "floor": 1}, reason="room"
+            )
+            second = main.maybe_commit_memory_checkpoint(
+                config, {"state_type": "monster", "floor": 1}, reason="room"
+            )
+            Path(tmpdir, "BATTLE_LOG.md").write_text("floor 2\n", encoding="utf-8")
+            third = main.maybe_commit_memory_checkpoint(
+                config, {"state_type": "monster", "floor": 2}, reason="room"
+            )
+
+            self.assertEqual(first["status"], "committed")
+            self.assertEqual(second["status"], "skipped")
+            self.assertEqual(third["status"], "committed")
+            count = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=tmpdir,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self.assertEqual(count, "2")
+
+    def test_run_end_checkpoint_commits_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            subprocess.run(["git", "init"], cwd=tmpdir, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=tmpdir,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=tmpdir,
+                check=True,
+            )
+            Path(tmpdir, "STRATEGY.md").write_text("updated\n", encoding="utf-8")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                    memory_git_dir=tmpdir,
+                    memory_commit_on_run_end=True,
+                    memory_commit_paths=("STRATEGY.md",),
+                ),
+            )
+            main.start_logged_run(config, {"state_type": "monster"}, None)
+
+            result = main.maybe_commit_memory_checkpoint(
+                config, {"state_type": "game_over", "floor": 12}, reason="run_end"
+            )
+
+            self.assertEqual(result["status"], "committed")
+            log = subprocess.run(
+                ["git", "log", "--oneline", "-1"],
+                cwd=tmpdir,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout
+            self.assertIn("memory run-end snapshot", log)
+
 
 class InvalidActionLoggingTests(unittest.TestCase):
     def test_nested_run_floor_and_act_are_logged(self):
@@ -487,6 +652,22 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
                 config,
                 prompt_hash="prompt-hash",
                 response_hash="response-hash",
+                prompt_text="full prompt",
+                response_text="full response",
+                raw_response={"id": "gen-1", "choices": []},
+                request_payload={"model": "model"},
+                provider_name="OpenRouter",
+                request_id="req-1",
+                response_id="gen-1",
+                generation_id="gen-1",
+                upstream_id="chatcmpl-1",
+                total_cost=0.012,
+                prompt_cost=0.004,
+                completion_cost=0.008,
+                native_tokens_prompt=100,
+                native_tokens_completion=50,
+                generation_stats={"data": {"total_cost": 0.012}},
+                generation_content={"data": {"output": {"completion": "full response"}}},
                 input_tokens=123,
                 output_tokens=45,
                 tool_calls={
@@ -502,24 +683,52 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
             run_row = conn.execute(
                 """
                 SELECT total_model_calls, total_input_tokens, total_output_tokens,
-                       total_tool_calls
+                       total_tool_calls, total_cost, total_prompt_cost,
+                       total_completion_cost, total_native_tokens_prompt,
+                       total_native_tokens_completion
                 FROM runs WHERE run_id = ?
                 """,
                 (start["run_id"],),
             ).fetchone()
             step_row = conn.execute(
                 """
-                SELECT prompt_hash, response_hash, tool_calls
+                SELECT prompt_hash, response_hash, tool_calls, prompt_text,
+                       response_text, raw_response_json, request_json,
+                       provider_name, request_id, response_id, generation_id,
+                       upstream_id, total_cost, prompt_cost, completion_cost,
+                       native_tokens_prompt, native_tokens_completion,
+                       generation_stats_json, generation_content_json
                 FROM steps WHERE run_id = ?
                 """,
                 (start["run_id"],),
             ).fetchone()
             conn.close()
 
-            self.assertEqual(run_row, (1, 123, 45, 7))
+            self.assertEqual(run_row[:4], (1, 123, 45, 7))
+            self.assertAlmostEqual(run_row[4], 0.012)
+            self.assertAlmostEqual(run_row[5], 0.004)
+            self.assertAlmostEqual(run_row[6], 0.008)
+            self.assertEqual(run_row[7], 100)
+            self.assertEqual(run_row[8], 50)
             self.assertEqual(step_row[0], "prompt-hash")
             self.assertEqual(step_row[1], "response-hash")
             self.assertIn('"memory_writes": 2', step_row[2])
+            self.assertEqual(step_row[3], "full prompt")
+            self.assertEqual(step_row[4], "full response")
+            self.assertIn('"id": "gen-1"', step_row[5])
+            self.assertIn('"model": "model"', step_row[6])
+            self.assertEqual(step_row[7], "OpenRouter")
+            self.assertEqual(step_row[8], "req-1")
+            self.assertEqual(step_row[9], "gen-1")
+            self.assertEqual(step_row[10], "gen-1")
+            self.assertEqual(step_row[11], "chatcmpl-1")
+            self.assertAlmostEqual(step_row[12], 0.012)
+            self.assertAlmostEqual(step_row[13], 0.004)
+            self.assertAlmostEqual(step_row[14], 0.008)
+            self.assertEqual(step_row[15], 100)
+            self.assertEqual(step_row[16], 50)
+            self.assertIn('"total_cost": 0.012', step_row[17])
+            self.assertIn('"completion": "full response"', step_row[18])
 
     def test_record_model_telemetry_can_attach_to_invalid_agent_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:

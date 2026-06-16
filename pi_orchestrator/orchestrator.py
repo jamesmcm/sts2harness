@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -143,6 +144,20 @@ class ModelProvider:
 class ModelCompletion:
     decision: JsonDict
     raw_response: JsonDict
+    response_text: str
+    request_payload: JsonDict
+    provider_name: str | None = None
+    request_id: str | None = None
+    response_id: str | None = None
+    generation_id: str | None = None
+    upstream_id: str | None = None
+    total_cost: float | None = None
+    prompt_cost: float | None = None
+    completion_cost: float | None = None
+    native_tokens_prompt: int | None = None
+    native_tokens_completion: int | None = None
+    generation_stats: JsonDict | None = None
+    generation_content: JsonDict | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
@@ -182,6 +197,21 @@ class HttpJsonProvider(ModelProvider):
             raise RuntimeError("model API returned a non-object JSON response")
         return value
 
+    def _get_json(self, url: str) -> JsonDict:
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=self.config.timeout) as response:
+            value = json.loads(response.read().decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("model API returned a non-object JSON response")
+        return value
+
 
 class OpenAIResponsesProvider(HttpJsonProvider):
     def complete_json(self, prompt: str) -> ModelCompletion:
@@ -206,7 +236,9 @@ class OpenAIResponsesProvider(HttpJsonProvider):
         response = self._post_json(f"{base_url.rstrip('/')}/responses", payload)
         text = response.get("output_text")
         if isinstance(text, str) and text.strip():
-            return _completion_from_response(_parse_json_text(text), response)
+            return _completion_from_response(
+                _parse_json_text(text), response, text, payload
+            )
         output = response.get("output")
         if isinstance(output, list):
             for item in output:
@@ -217,8 +249,9 @@ class OpenAIResponsesProvider(HttpJsonProvider):
                     continue
                 for part in content:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        text = part["text"]
                         return _completion_from_response(
-                            _parse_json_text(part["text"]), response
+                            _parse_json_text(text), response, text, payload
                         )
         raise RuntimeError("OpenAI Responses API returned no text output")
 
@@ -253,8 +286,9 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
                 choices[0].get("message") if isinstance(choices[0], dict) else None
             )
             if isinstance(message, dict) and isinstance(message.get("content"), str):
+                text = message["content"]
                 return _completion_from_response(
-                    _parse_json_text(message["content"]), response
+                    _parse_json_text(text), response, text, payload
                 )
         raise RuntimeError("OpenAI-compatible API returned no message content")
 
@@ -269,6 +303,39 @@ class OpenRouterProvider(OpenAICompatibleChatProvider):
             timeout=config.timeout,
         )
         super().__init__(config)
+
+    def complete_json(self, prompt: str) -> ModelCompletion:
+        completion = super().complete_json(prompt)
+        generation_id = completion.generation_id or completion.response_id
+        generation_stats = completion.generation_stats
+        generation_content = completion.generation_content
+        if generation_id:
+            generation_stats = self._get_generation_json("generation", generation_id)
+            generation_content = self._get_generation_json(
+                "generation/content", generation_id
+            )
+        return _enrich_openrouter_completion(
+            completion,
+            generation_stats=generation_stats,
+            generation_content=generation_content,
+        )
+
+    def _get_generation_json(self, endpoint: str, generation_id: str) -> JsonDict | None:
+        base_url = self.config.base_url or "https://openrouter.ai/api/v1"
+        query = urllib.parse.urlencode({"id": generation_id})
+        url = f"{base_url.rstrip('/')}/{endpoint}?{query}"
+        for attempt in range(3):
+            if attempt:
+                time.sleep(0.75 * attempt)
+            try:
+                return self._get_json(url)
+            except urllib.error.HTTPError as exc:
+                if exc.code in {404, 429, 500, 502}:
+                    continue
+                return {"error": f"HTTP {exc.code}", "body": exc.read().decode("utf-8", errors="replace")}
+            except (TimeoutError, urllib.error.URLError):
+                continue
+        return None
 
 
 def make_provider(config: ModelConfig) -> ModelProvider:
@@ -301,14 +368,22 @@ def _parse_json_text(text: str) -> JsonDict:
 
 
 def _completion_from_response(
-    decision: JsonDict, response: JsonDict
+    decision: JsonDict,
+    response: JsonDict,
+    response_text: str,
+    request_payload: JsonDict,
 ) -> ModelCompletion:
     usage = response.get("usage")
     if not isinstance(usage, dict):
         usage = {}
+    response_id = _optional_str(response.get("id"))
     return ModelCompletion(
         decision=decision,
         raw_response=response,
+        response_text=response_text,
+        request_payload=request_payload,
+        response_id=response_id,
+        generation_id=response_id,
         input_tokens=_usage_int(
             usage, "input_tokens", "prompt_tokens", "total_input_tokens"
         ),
@@ -317,6 +392,99 @@ def _completion_from_response(
         ),
         total_tokens=_usage_int(usage, "total_tokens"),
     )
+
+
+def _enrich_openrouter_completion(
+    completion: ModelCompletion,
+    *,
+    generation_stats: JsonDict | None,
+    generation_content: JsonDict | None,
+) -> ModelCompletion:
+    data = _generation_data(generation_stats)
+    content_data = _generation_data(generation_content)
+    prompt_text = None
+    response_text = completion.response_text
+    if content_data:
+        input_data = content_data.get("input")
+        if isinstance(input_data, dict):
+            prompt_text = _optional_str(input_data.get("prompt"))
+        output_data = content_data.get("output")
+        if isinstance(output_data, dict):
+            response_text = _optional_str(output_data.get("completion")) or response_text
+
+    total_cost = _float_from_data(data, "total_cost", "usage")
+    native_prompt = _int_from_data(data, "native_tokens_prompt", "tokens_prompt")
+    native_completion = _int_from_data(
+        data, "native_tokens_completion", "tokens_completion"
+    )
+    prompt_cost, completion_cost = _split_cost(
+        total_cost, native_prompt, native_completion
+    )
+    return ModelCompletion(
+        decision=completion.decision,
+        raw_response=completion.raw_response,
+        response_text=response_text,
+        request_payload=completion.request_payload,
+        provider_name=_optional_str(data.get("provider_name")),
+        request_id=_optional_str(data.get("request_id")),
+        response_id=completion.response_id,
+        generation_id=_optional_str(data.get("id")) or completion.generation_id,
+        upstream_id=_optional_str(data.get("upstream_id")),
+        total_cost=total_cost,
+        prompt_cost=prompt_cost,
+        completion_cost=completion_cost,
+        native_tokens_prompt=native_prompt,
+        native_tokens_completion=native_completion,
+        generation_stats=generation_stats,
+        generation_content=generation_content,
+        input_tokens=completion.input_tokens,
+        output_tokens=completion.output_tokens,
+        total_tokens=completion.total_tokens,
+    )
+
+
+def _generation_data(value: JsonDict | None) -> JsonDict:
+    if not isinstance(value, dict):
+        return {}
+    data = value.get("data")
+    return data if isinstance(data, dict) else value
+
+
+def _int_from_data(data: JsonDict, *keys: str) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _float_from_data(data: JsonDict, *keys: str) -> float | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _split_cost(
+    total_cost: float | None,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+) -> tuple[float | None, float | None]:
+    if total_cost is None or prompt_tokens is None or completion_tokens is None:
+        return None, None
+    token_total = prompt_tokens + completion_tokens
+    if token_total <= 0:
+        return None, None
+    prompt_cost = total_cost * (prompt_tokens / token_total)
+    return prompt_cost, total_cost - prompt_cost
 
 
 def _usage_int(usage: JsonDict, *keys: str) -> int | None:
@@ -449,6 +617,22 @@ def run(config: OrchestratorConfig) -> int:
                 {
                     "prompt_hash": _sha256_text(prompt),
                     "response_hash": _sha256_json(completion.raw_response),
+                    "prompt_text": prompt,
+                    "response_text": completion.response_text,
+                    "raw_response": completion.raw_response,
+                    "request_payload": completion.request_payload,
+                    "provider_name": completion.provider_name,
+                    "request_id": completion.request_id,
+                    "response_id": completion.response_id,
+                    "generation_id": completion.generation_id,
+                    "upstream_id": completion.upstream_id,
+                    "total_cost": completion.total_cost,
+                    "prompt_cost": completion.prompt_cost,
+                    "completion_cost": completion.completion_cost,
+                    "native_tokens_prompt": completion.native_tokens_prompt,
+                    "native_tokens_completion": completion.native_tokens_completion,
+                    "generation_stats": completion.generation_stats,
+                    "generation_content": completion.generation_content,
                     "input_tokens": completion.input_tokens,
                     "output_tokens": completion.output_tokens,
                     "tool_calls": tool_calls,
@@ -467,6 +651,19 @@ def run(config: OrchestratorConfig) -> int:
                         "input_tokens": completion.input_tokens,
                         "output_tokens": completion.output_tokens,
                         "total_tokens": completion.total_tokens,
+                    },
+                    "cost": {
+                        "total_cost": completion.total_cost,
+                        "prompt_cost": completion.prompt_cost,
+                        "completion_cost": completion.completion_cost,
+                        "native_tokens_prompt": completion.native_tokens_prompt,
+                        "native_tokens_completion": completion.native_tokens_completion,
+                    },
+                    "ids": {
+                        "request_id": completion.request_id,
+                        "response_id": completion.response_id,
+                        "generation_id": completion.generation_id,
+                        "upstream_id": completion.upstream_id,
                     },
                     "prompt_hash": _sha256_text(prompt),
                     "response_hash": _sha256_json(completion.raw_response),

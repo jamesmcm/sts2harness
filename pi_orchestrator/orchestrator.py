@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -285,7 +287,13 @@ class HttpJsonProvider(ModelProvider):
                     raise RuntimeError(f"model API HTTP {exc.code}: {body}") from exc
                 self._sleep_before_retry(method, attempt, f"HTTP {exc.code}")
                 continue
-            except (TimeoutError, urllib.error.URLError) as exc:
+            except (
+                TimeoutError,
+                ConnectionError,
+                http.client.HTTPException,
+                ssl.SSLError,
+                urllib.error.URLError,
+            ) as exc:
                 if not self._should_retry_network(attempt):
                     raise RuntimeError(f"model API request failed: {exc}") from exc
                 self._sleep_before_retry(method, attempt, exc.__class__.__name__)

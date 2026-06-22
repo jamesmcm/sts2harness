@@ -61,6 +61,9 @@ class PiRpcServer:
             mcp_delay=config.mcp_delay,
         )
 
+    def _reload_harness_config(self) -> None:
+        self.harness_config = harness.load_harness_config(self.config.harness_config)
+
     def dispatch(self, method: str, params: JsonDict) -> Any:
         methods = {
             "ping": self.ping,
@@ -89,9 +92,13 @@ class PiRpcServer:
 
     def actions(self, params: JsonDict) -> JsonDict:
         del params
+        self._reload_harness_config()
         state = harness._wait_for_play_phase(self.client)
         state, auto_actions = harness.resolve_auto_actions(
             self.client, state, self.harness_config
+        )
+        self.harness_config = harness.refresh_harness_config_from_progress(
+            self.harness_config
         )
         actions = harness.build_actions(state, self.harness_config.run_setup)
         output: JsonDict = {
@@ -104,17 +111,26 @@ class PiRpcServer:
 
     def snapshot(self, params: JsonDict) -> JsonDict:
         del params
+        self._reload_harness_config()
         state = harness._wait_for_play_phase(self.client)
         auto_actions: list[JsonDict] = []
         if state.get("state_type") != "game_over":
             state, auto_actions = harness.resolve_auto_actions(
                 self.client, state, self.harness_config
             )
+            self.harness_config = harness.refresh_harness_config_from_progress(
+                self.harness_config
+            )
         actions = harness.build_actions(state, self.harness_config.run_setup)
         output: JsonDict = {
             "state": state,
             "actions": harness.action_dicts(actions),
         }
+        objective_battle_log = harness.build_objective_battle_log(
+            self.harness_config, state
+        )
+        if objective_battle_log is not None:
+            output["objective_battle_log"] = objective_battle_log
         if auto_actions:
             output["auto_actions"] = auto_actions
         progress_update = harness.maybe_update_progress_after_state(
@@ -122,12 +138,16 @@ class PiRpcServer:
         )
         if progress_update is not None:
             output["progress_update"] = progress_update
+            self.harness_config = harness.refresh_harness_config_from_progress(
+                self.harness_config
+            )
         harness.finalize_logged_run(self.harness_config, state)
         return output
 
     def act(self, params: JsonDict) -> JsonDict:
         if "action" not in params:
             raise ValueError("act requires an action index or ID in params.action")
+        self._reload_harness_config()
         action_ref = str(params["action"])
         before = harness._wait_for_play_phase(self.client)
         pre_auto_actions: list[JsonDict] = []
@@ -157,6 +177,9 @@ class PiRpcServer:
             )
             if progress_update is not None:
                 output["progress_update"] = progress_update
+                self.harness_config = harness.refresh_harness_config_from_progress(
+                    self.harness_config
+                )
             harness.finalize_logged_run(self.harness_config, before)
             if before.get("state_type") == "game_over":
                 memory_commit = harness.maybe_commit_memory_checkpoint(
@@ -178,6 +201,10 @@ class PiRpcServer:
             run_end_progress_update = harness.maybe_update_progress_after_state(
                 self.client, before, self.harness_config.run_setup
             )
+            if run_end_progress_update is not None:
+                self.harness_config = harness.refresh_harness_config_from_progress(
+                    self.harness_config
+                )
             harness.finalize_logged_run(self.harness_config, before)
             run_end_memory_commit = harness.maybe_commit_memory_checkpoint(
                 self.harness_config, before, reason="run_end"
@@ -200,6 +227,9 @@ class PiRpcServer:
         after, post_auto_actions = harness.resolve_auto_actions(
             self.client, after, self.harness_config, previous_action=action
         )
+        self.harness_config = harness.refresh_harness_config_from_progress(
+            self.harness_config
+        )
         output["state"] = after
         output["actions"] = harness.action_dicts(
             harness.build_actions(after, self.harness_config.run_setup)
@@ -211,6 +241,9 @@ class PiRpcServer:
         )
         if progress_update is not None:
             output["progress_update"] = progress_update
+            self.harness_config = harness.refresh_harness_config_from_progress(
+                self.harness_config
+            )
         harness.finalize_logged_run(self.harness_config, after)
         memory_commit = harness.maybe_commit_memory_checkpoint(
             self.harness_config,

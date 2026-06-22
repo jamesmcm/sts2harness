@@ -1,4 +1,5 @@
 import io
+import http.client
 import unittest
 import json
 import os
@@ -57,6 +58,113 @@ class WaitForPlayPhaseTests(unittest.TestCase):
         self.assertEqual(state["battle"]["turn"], "player")
         self.assertIs(state["battle"]["is_play_phase"], True)
         self.assertEqual(client.calls, 3)
+
+    def test_post_end_turn_waits_past_short_transitional_hand(self):
+        before = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player"},
+            "player": {
+                "energy": 0,
+                "max_energy": 3,
+                "hand": [{"index": 0, "name": "Strike"}],
+                "draw_pile_count": 8,
+                "discard_pile_count": 1,
+                "relics": [],
+            },
+        }
+        partial = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 3,
+                "max_energy": 3,
+                "hand": [{"index": 0, "name": "Defend", "can_play": True}],
+            },
+        }
+        ready = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 3,
+                "max_energy": 3,
+                "hand": [
+                    {"index": index, "name": f"card {index}", "can_play": True}
+                    for index in range(5)
+                ],
+            },
+        }
+        action = main.Action(
+            id="end_turn",
+            label="End turn",
+            category="combat",
+            request={"action": "end_turn"},
+        )
+        client = FakeClient([partial, ready])
+
+        state = main._wait_for_post_action_state(
+            client,
+            previous_state=before,
+            previous_action=action,
+            poll_interval=0,
+        )
+
+        self.assertIs(state, ready)
+        self.assertEqual(client.calls, 2)
+
+    def test_post_end_turn_waits_for_paels_tears_energy(self):
+        before = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player"},
+            "player": {
+                "energy": 1,
+                "max_energy": 3,
+                "hand": [{"index": 0, "name": "Strike"}],
+                "draw_pile_count": 8,
+                "discard_pile_count": 1,
+                "relics": [{"name": "Pael's Tears"}],
+            },
+        }
+        partial = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 3,
+                "max_energy": 3,
+                "hand": [
+                    {"index": index, "name": f"card {index}", "can_play": True}
+                    for index in range(5)
+                ],
+            },
+        }
+        ready = {
+            "state_type": "monster",
+            "battle": {"is_play_phase": True, "turn": "player", "enemies": []},
+            "player": {
+                "energy": 5,
+                "max_energy": 3,
+                "hand": [
+                    {"index": index, "name": f"card {index}", "can_play": True}
+                    for index in range(5)
+                ],
+            },
+        }
+        action = main.Action(
+            id="end_turn",
+            label="End turn",
+            category="combat",
+            request={"action": "end_turn"},
+        )
+        client = FakeClient([partial, ready])
+
+        state = main._wait_for_post_action_state(
+            client,
+            previous_state=before,
+            previous_action=action,
+            poll_interval=0,
+        )
+
+        self.assertIs(state, ready)
+        self.assertEqual(client.calls, 2)
 
 
 class PiOrchestratorConfigTests(unittest.TestCase):
@@ -316,6 +424,28 @@ class PiOrchestratorHttpRetryTests(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             with self.assertRaisesRegex(RuntimeError, "model API HTTP 503: still down"):
                 provider._post_json("https://example.test/v1", {"x": 1})
+
+    def test_post_json_retries_remote_disconnected(self):
+        provider = RetryHttpProvider((0,))
+        calls = 0
+
+        def fake_urlopen(request, timeout):
+            nonlocal calls
+            del request, timeout
+            calls += 1
+            if calls == 1:
+                raise http.client.RemoteDisconnected(
+                    "Remote end closed connection without response"
+                )
+            return FakeHttpResponse(b'{"ok": true}')
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("time.sleep") as sleep:
+                response = provider._post_json("https://example.test/v1", {"x": 1})
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(calls, 2)
+        sleep.assert_not_called()
 
 
 class MalformedJsonProvider(orchestrator.ModelProvider):
@@ -1230,6 +1360,100 @@ class RunSetupActionTests(unittest.TestCase):
         self.assertEqual(len(auto_actions), 5)
         self.assertEqual(auto_actions[-1]["run_setup_verification"]["status"], "ok")
 
+    def test_auto_resolve_uses_progress_bump_for_next_run_after_victory(self):
+        class FakeActionClient:
+            def __init__(self):
+                self.requests = []
+                self.states = [
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "main_menu",
+                        "options": [{"name": "singleplayer", "enabled": True}],
+                    },
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "singleplayer",
+                        "options": [{"name": "custom", "enabled": True}],
+                    },
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "custom_run",
+                        "options": [{"name": "confirm", "enabled": True}],
+                    },
+                    {
+                        "state_type": "monster",
+                        "battle": {"is_play_phase": True, "turn": "player"},
+                    },
+                ]
+
+            def post_action(self, request):
+                self.requests.append(request)
+                return {"status": "ok"}
+
+            def get_state(self, *, response_format="json"):
+                del response_format
+                return self.states.pop(0)
+
+        old_verify = main.verify_started_run_setup
+        try:
+            main.verify_started_run_setup = lambda action, setup: {
+                "status": "ok",
+                "expected": {"seed": setup.seed, "ascension": setup.ascension},
+            }
+            with tempfile.TemporaryDirectory() as tmpdir:
+                progress_file = str(Path(tmpdir) / "progress.json")
+                history = Path(tmpdir) / "saves" / "history"
+                history.mkdir(parents=True)
+                (history / "run1.run").write_text(
+                    json.dumps(
+                        {
+                            "run_id": "run-1",
+                            "seed": "S1",
+                            "ascension": 0,
+                            "victory": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                config = main.HarnessConfig(
+                    run_setup=main.RunSetup(
+                        seed="S1",
+                        seed_set=("S1", "S2"),
+                        seed_policy="fixed_list_until_win",
+                        ascension=0,
+                        progress_file=progress_file,
+                        save_root=tmpdir,
+                    ),
+                    auto_resolve=True,
+                    max_auto_actions=4,
+                )
+                client = FakeActionClient()
+
+                state, auto_actions = main.resolve_auto_actions(
+                    client,
+                    {"state_type": "game_over"},
+                    config,
+                    wait=0,
+                )
+        finally:
+            main.verify_started_run_setup = old_verify
+
+        self.assertEqual(state["state_type"], "monster")
+        self.assertEqual(
+            client.requests[-1],
+            {
+                "action": "menu_select",
+                "option": "confirm",
+                "seed": "S2",
+                "ascension": 1,
+            },
+        )
+        self.assertEqual(auto_actions[-1]["run_setup_verification"]["status"], "ok")
+        self.assertEqual(
+            auto_actions[-1]["run_setup_verification"]["expected"],
+            {"seed": "S2", "ascension": 1},
+        )
+
 
 class ActionGenerationTests(unittest.TestCase):
     def test_end_turn_requires_confirmation_with_energy_and_playable_cards(self):
@@ -1260,6 +1484,56 @@ class ActionGenerationTests(unittest.TestCase):
         actions = main.build_actions(state)
 
         self.assertIn("end_turn", [action.id for action in actions])
+
+    def test_hand_select_action_labels_selectable_index_mapping(self):
+        state = {
+            "state_type": "hand_select",
+            "hand_select": {
+                "cards": [
+                    {"index": 0, "name": "Setup Strike"},
+                    {"index": 1, "name": "Twin Strike"},
+                    {"index": 6, "name": "Howl from Beyond"},
+                ],
+            },
+            "player": {
+                "hand": [
+                    {"index": 0, "name": "Setup Strike"},
+                    {"index": 1, "name": "Twin Strike"},
+                    {"index": 7, "name": "Howl from Beyond"},
+                ]
+            },
+        }
+
+        actions = main.build_actions(state)
+        howl = next(action for action in actions if action.id == "combat_select_card:6")
+
+        self.assertEqual(
+            howl.label, "Select selectable[6] Howl from Beyond (player hand[7])"
+        )
+        self.assertEqual(
+            howl.request, {"action": "combat_select_card", "card_index": 6}
+        )
+        self.assertIn("maps to player.hand[7]", howl.notes[1])
+
+    def test_hand_select_keeps_combat_potion_use_actions(self):
+        state = {
+            "state_type": "hand_select",
+            "battle": {"is_play_phase": True, "turn": "player"},
+            "hand_select": {
+                "cards": [{"index": 0, "name": "Strike"}],
+                "can_confirm": True,
+            },
+            "player": {
+                "potions": [{"slot": 0, "name": "Flex Potion"}],
+            },
+        }
+
+        actions = main.build_actions(state)
+        action_ids = [action.id for action in actions]
+
+        self.assertIn("use_potion:0", action_ids)
+        self.assertIn("discard_potion:0", action_ids)
+        self.assertIn("combat_select_card:0", action_ids)
 
     def test_full_potion_reward_is_visible_but_disabled(self):
         state = {
@@ -1826,6 +2100,81 @@ class InvalidActionLoggingTests(unittest.TestCase):
             self.assertIn("play_card:7", step_row[1])
             self.assertEqual(step_row[2], "play_card:7")
             self.assertEqual(step_row[3], "not legal")
+
+    def test_objective_battle_log_summarizes_prior_observed_actions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                ),
+            )
+            state = {
+                "state_type": "monster",
+                "floor": 14,
+                "battle": {
+                    "is_play_phase": True,
+                    "turn": "player",
+                    "enemies": [{"entity_id": "CULTIST_0", "name": "Cultist", "hp": 20}],
+                },
+                "player": {
+                    "hp": 28,
+                    "max_hp": 80,
+                    "energy": 3,
+                    "max_energy": 3,
+                    "hand": [
+                        {"index": 0, "name": "Strike", "can_play": True},
+                        {"index": 1, "name": "Defend", "can_play": True},
+                    ],
+                    "draw_pile_count": 10,
+                    "discard_pile_count": 0,
+                },
+            }
+            action = main.Action(
+                id="play_card:0:cultist_0",
+                label="Play hand[0] Strike on Cultist",
+                category="combat",
+                request={
+                    "action": "play_card",
+                    "card_index": 0,
+                    "target": "CULTIST_0",
+                },
+            )
+            main.start_logged_run(config, state, None)
+            main.log_step(config, state, [action], action, action_source="agent")
+
+            current = {
+                **state,
+                "player": {
+                    **state["player"],
+                    "energy": 2,
+                    "hand": [{"index": 0, "name": "Defend", "can_play": True}],
+                    "discard_pile_count": 1,
+                },
+            }
+            log = main.build_objective_battle_log(config, current)
+
+        self.assertIsNotNone(log)
+        assert log is not None
+        self.assertIn("state before the listed action", log["note"])
+        self.assertEqual(log["current_observed_state"]["energy"], 2)
+        self.assertEqual(log["entries"][0]["energy"], 3)
+        self.assertEqual(log["entries"][0]["hand_count"], 2)
+        self.assertEqual(
+            log["entries"][0]["action_chosen"]["id"], "play_card:0:cultist_0"
+        )
 
     def test_finalize_logged_run_fills_history_fields_and_summary(self):
         with tempfile.TemporaryDirectory() as tmpdir:

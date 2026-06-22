@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -437,6 +437,25 @@ def load_run_setup(config_path: str) -> RunSetup:
     return load_harness_config(config_path).run_setup
 
 
+def refresh_run_setup_from_progress(run_setup: RunSetup) -> RunSetup:
+    progress = _load_json_file(run_setup.progress_file)
+    setup = run_setup
+    current_ascension = progress.get("ascension")
+    if isinstance(current_ascension, int):
+        setup = replace(setup, ascension=current_ascension)
+    seed = current_seed_for_setup(setup, progress)
+    if seed != setup.seed:
+        setup = replace(setup, seed=seed)
+    return setup
+
+
+def refresh_harness_config_from_progress(config: HarnessConfig) -> HarnessConfig:
+    setup = refresh_run_setup_from_progress(config.run_setup)
+    if setup == config.run_setup:
+        return config
+    return replace(config, run_setup=setup)
+
+
 def current_seed_for_setup(
     run_setup: RunSetup, progress: JsonDict | None = None
 ) -> str | None:
@@ -507,6 +526,125 @@ def _playable_hand_cards(state: JsonDict) -> list[JsonDict]:
     return [
         card for card in hand if isinstance(card, dict) and card.get("can_play") is True
     ]
+
+
+def _hand_cards(state: JsonDict) -> list[JsonDict]:
+    hand = _player(state).get("hand")
+    if not isinstance(hand, list):
+        return []
+    return [card for card in hand if isinstance(card, dict)]
+
+
+def _pile_count(player: JsonDict, key: str) -> int:
+    value = player.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _relic_descriptions(state: JsonDict) -> dict[str, str]:
+    relics = _player(state).get("relics")
+    if not isinstance(relics, list):
+        return {}
+    result: dict[str, str] = {}
+    for relic in relics:
+        if not isinstance(relic, dict):
+            continue
+        name = relic.get("name")
+        if isinstance(name, str) and name:
+            result[name] = str(relic.get("description") or "")
+    return result
+
+
+def _expected_next_turn_energy(state: JsonDict) -> int | None:
+    energy = _current_energy(state)
+    player = _player(state)
+    max_energy = player.get("max_energy")
+    if not isinstance(energy, int) or not isinstance(max_energy, int):
+        return None
+    expected = max_energy
+    relics = _relic_descriptions(state)
+    if energy > 0 and "Ice Cream" in relics:
+        expected += energy
+    if energy > 0 and "Pael's Tears" in relics:
+        expected += 2
+    return expected
+
+
+def _expected_next_turn_hand_min(state: JsonDict) -> int | None:
+    player = _player(state)
+    if not isinstance(player.get("hand"), list):
+        return None
+    available_cards = (
+        len(_hand_cards(state))
+        + _pile_count(player, "draw_pile_count")
+        + _pile_count(player, "discard_pile_count")
+    )
+    if available_cards <= 0:
+        return None
+    expected = min(5, available_cards)
+    if "Pael's Blood" in _relic_descriptions(state):
+        expected = min(expected + 1, available_cards)
+    return expected
+
+
+def _combat_state_ready_after_end_turn(
+    state: JsonDict,
+    *,
+    min_energy: int | None,
+    min_hand: int | None,
+) -> bool:
+    state_type = str(state.get("state_type") or "")
+    if not _combat_like(state_type):
+        return True
+    battle = _battle(state)
+    if battle.get("is_play_phase") is not True or battle.get("turn") != "player":
+        return False
+    energy = _current_energy(state)
+    if min_energy is not None and isinstance(energy, int) and energy < min_energy:
+        return False
+    if min_hand is not None and len(_hand_cards(state)) < min_hand:
+        return False
+    return _combat_snapshot_has_actionable_choices(state)
+
+
+def _wait_for_post_action_state(
+    client: Sts2Client,
+    *,
+    previous_state: JsonDict | None = None,
+    previous_action: Action | None = None,
+    poll_interval: float = 0.1,
+    max_wait: float = 20.0,
+) -> JsonDict:
+    if previous_action is None or previous_action.request.get("action") != "end_turn":
+        return _wait_for_play_phase(
+            client, poll_interval=poll_interval, max_wait=max_wait
+        )
+
+    min_energy = None
+    if previous_state is not None:
+        min_energy = _expected_next_turn_energy(previous_state)
+    min_hand = (
+        _expected_next_turn_hand_min(previous_state)
+        if previous_state is not None
+        else None
+    )
+    deadline = time.monotonic() + min(max(0.0, max_wait), 5.0)
+    last_state: JsonDict | None = None
+    while True:
+        state = _wait_for_play_phase(
+            client,
+            poll_interval=poll_interval,
+            max_wait=max(0.0, deadline - time.monotonic()),
+        )
+        last_state = state
+        if _combat_state_ready_after_end_turn(
+            state, min_energy=min_energy, min_hand=min_hand
+        ):
+            return state
+        if time.monotonic() >= deadline:
+            return last_state
+        sleep_for = min(poll_interval, max(0.0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
 
 
 def _combat_like(state_type: str) -> bool:
@@ -702,7 +840,9 @@ def _global_potion_actions(state: JsonDict) -> list[Action]:
 
     state_type = str(state.get("state_type") or "")
     in_play_phase = _battle(state).get("is_play_phase") is True
-    can_use_context = _combat_like(state_type) and in_play_phase
+    can_use_context = (_combat_like(state_type) and in_play_phase) or (
+        state_type == "hand_select" and bool(_battle(state))
+    )
 
     for potion in potions:
         slot = potion.get("slot")
@@ -824,6 +964,12 @@ def _combat_selection_actions(state: JsonDict) -> list[Action]:
     if not isinstance(hand_select, dict):
         return []
     actions: list[Action] = []
+    player_hand_by_name: dict[str, list[int]] = {}
+    for hand_card in _hand_cards(state):
+        hand_index = hand_card.get("index")
+        hand_name = hand_card.get("name") or hand_card.get("id")
+        if isinstance(hand_index, int) and hand_name is not None:
+            player_hand_by_name.setdefault(str(hand_name), []).append(hand_index)
     for card in hand_select.get("cards") or []:
         if not isinstance(card, dict):
             continue
@@ -831,12 +977,30 @@ def _combat_selection_actions(state: JsonDict) -> list[Action]:
         if not isinstance(index, int):
             continue
         card_name = _name(card, "name", "id", fallback=f"card {index}")
+        notes: list[str] = [
+            (
+                "This index is from hand_select.cards, which may be reindexed "
+                "after selections and may differ from player.hand[]."
+            ),
+        ]
+        hand_indices = player_hand_by_name.get(card_name, [])
+        if len(hand_indices) == 1 and hand_indices[0] != index:
+            label = (
+                f"Select selectable[{index}] {card_name} "
+                f"(player hand[{hand_indices[0]}])"
+            )
+            notes.append(
+                f"Selectable index {index} maps to player.hand[{hand_indices[0]}]."
+            )
+        else:
+            label = f"Select selectable[{index}] {card_name}"
         actions.append(
             Action(
                 id=f"combat_select_card:{index}",
-                label=f"Select hand card[{index}] {card_name}",
+                label=label,
                 category="combat_selection",
                 request={"action": "combat_select_card", "card_index": index},
+                notes=tuple(notes),
             )
         )
     if hand_select.get("can_confirm") is True:
@@ -1813,6 +1977,7 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
           action_chosen TEXT,
           action_source TEXT NOT NULL,
           observation_hash TEXT,
+          observation_json TEXT,
           prompt_hash TEXT,
           response_hash TEXT,
           prompt_text TEXT,
@@ -1865,6 +2030,7 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
         "steps",
         {
             "prompt_text": "TEXT",
+            "observation_json": "TEXT",
             "response_text": "TEXT",
             "raw_response_json": "TEXT",
             "request_json": "TEXT",
@@ -2290,8 +2456,8 @@ def log_step(
         INSERT INTO steps (
           run_id, step_index, floor, room_type, state_type, hp, max_hp, gold,
           deck_size, relic_count, potion_count, legal_actions, action_chosen,
-          action_source, observation_hash, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          action_source, observation_hash, observation_json, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -2309,6 +2475,7 @@ def log_step(
             json.dumps(action.as_dict(), sort_keys=True),
             action_source,
             hashlib.sha256(observation_json.encode("utf-8")).hexdigest(),
+            observation_json,
             _now_utc(),
         ),
     )
@@ -2360,9 +2527,9 @@ def log_invalid_action(
         INSERT INTO steps (
           run_id, step_index, floor, room_type, state_type, hp, max_hp, gold,
           deck_size, relic_count, potion_count, legal_actions, action_chosen,
-          action_source, observation_hash, invalid_action_ref,
+          action_source, observation_hash, observation_json, invalid_action_ref,
           invalid_action_error, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -2380,6 +2547,7 @@ def log_invalid_action(
             json.dumps(chosen, sort_keys=True),
             "invalid_agent",
             hashlib.sha256(observation_json.encode("utf-8")).hexdigest(),
+            observation_json,
             action_ref,
             error,
             _now_utc(),
@@ -2396,6 +2564,182 @@ def log_invalid_action(
     )
     conn.commit()
     conn.close()
+
+
+def build_objective_battle_log(
+    config: HarnessConfig, state: JsonDict, *, max_entries: int = 30
+) -> JsonDict | None:
+    state_type = str(state.get("state_type") or "")
+    if not (_combat_like(state_type) or state_type == "hand_select"):
+        return None
+    floor = _state_floor(state)
+    run_id = _progress_current_run_id(config)
+    conn = _connect_log_db(config)
+    if conn is None or run_id is None or floor is None:
+        if conn is not None:
+            conn.close()
+        return _current_objective_battle_log(state)
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT step_index, state_type, action_source, action_chosen,
+                   observation_json, prompt_text
+            FROM steps
+            WHERE run_id = ?
+              AND floor = ?
+              AND state_type IN ('monster', 'elite', 'boss', 'hand_select')
+            ORDER BY step_index DESC
+            LIMIT ?
+            """,
+            (run_id, floor, max(0, max_entries)),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    entries: list[JsonDict] = []
+    for row in reversed(rows):
+        observation = _step_observation_from_log(row[4], row[5])
+        if not isinstance(observation, dict):
+            continue
+        observed_state = observation.get("state")
+        if not isinstance(observed_state, dict):
+            continue
+        entry = _objective_state_summary(observed_state)
+        entry["step_index"] = row[0]
+        entry["action_source"] = row[2]
+        action = _json_dict_or_none(row[3])
+        if action is not None:
+            entry["action_chosen"] = _objective_action_summary(action)
+        entries.append(entry)
+
+    result = _current_objective_battle_log(state)
+    result["entries"] = entries
+    result["note"] = (
+        "Objective harness log: each entry is the observed state before the "
+        "listed action, so low energy/hand after plays should not be mistaken "
+        "for turn-start state."
+    )
+    return result
+
+
+def _current_objective_battle_log(state: JsonDict) -> JsonDict:
+    return {
+        "current_observed_state": _objective_state_summary(state),
+        "entries": [],
+    }
+
+
+def _step_observation_from_log(
+    observation_json: str | None, prompt_text: str | None
+) -> JsonDict | None:
+    observation = _json_dict_or_none(observation_json)
+    if observation is not None:
+        return observation
+    snapshot = _snapshot_from_prompt_text(prompt_text)
+    if isinstance(snapshot, dict):
+        return snapshot
+    return None
+
+
+def _snapshot_from_prompt_text(prompt_text: str | None) -> JsonDict | None:
+    if not isinstance(prompt_text, str):
+        return None
+    marker = "Snapshot:\n"
+    start = prompt_text.find(marker)
+    if start < 0:
+        return None
+    text = prompt_text[start + len(marker) :].lstrip()
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _json_dict_or_none(value: str | None) -> JsonDict | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _objective_action_summary(action: JsonDict) -> JsonDict:
+    summary: JsonDict = {}
+    for key in ("id", "label", "category", "request", "status", "error"):
+        if key in action:
+            summary[key] = action[key]
+    return summary
+
+
+def _objective_state_summary(state: JsonDict) -> JsonDict:
+    player = _player(state)
+    battle = _battle(state)
+    hand = _hand_cards(state)
+    summary: JsonDict = {
+        "floor": _state_floor(state),
+        "state_type": state.get("state_type"),
+        "hp": player.get("hp"),
+        "max_hp": player.get("max_hp"),
+        "energy": _current_energy(state),
+        "max_energy": player.get("max_energy"),
+        "hand_count": len(hand),
+        "hand": _objective_cards(hand),
+        "draw_pile_count": player.get("draw_pile_count"),
+        "discard_pile_count": player.get("discard_pile_count"),
+        "exhaust_pile_count": player.get("exhaust_pile_count"),
+    }
+    if battle:
+        summary["turn"] = battle.get("turn")
+        summary["is_play_phase"] = battle.get("is_play_phase")
+        enemies = battle.get("enemies")
+        if isinstance(enemies, list):
+            summary["enemies"] = _objective_enemies(enemies)
+    hand_select = state.get("hand_select")
+    if isinstance(hand_select, dict):
+        cards = hand_select.get("cards")
+        selected = hand_select.get("selected_cards")
+        summary["hand_select"] = {
+            "mode": hand_select.get("mode"),
+            "prompt": hand_select.get("prompt"),
+            "can_confirm": hand_select.get("can_confirm"),
+            "cards": _objective_cards(cards if isinstance(cards, list) else []),
+            "selected_cards": _objective_cards(
+                selected if isinstance(selected, list) else []
+            ),
+        }
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def _objective_cards(cards: list[Any], *, max_cards: int = 12) -> list[JsonDict]:
+    result: list[JsonDict] = []
+    for card in cards[:max_cards]:
+        if not isinstance(card, dict):
+            continue
+        item: JsonDict = {}
+        for key in ("index", "name", "id", "cost", "can_play", "is_upgraded"):
+            if key in card:
+                item[key] = card[key]
+        result.append(item)
+    if len(cards) > max_cards:
+        result.append({"more": len(cards) - max_cards})
+    return result
+
+
+def _objective_enemies(enemies: list[Any]) -> list[JsonDict]:
+    result: list[JsonDict] = []
+    for enemy in enemies:
+        if not isinstance(enemy, dict):
+            continue
+        item: JsonDict = {}
+        for key in ("entity_id", "name", "hp", "max_hp", "block", "intent", "dead"):
+            if key in enemy:
+                item[key] = enemy[key]
+        result.append(item)
+    return result
 
 
 def record_model_telemetry(
@@ -2875,6 +3219,8 @@ def resolve_auto_actions(
             progress_update = maybe_update_progress_after_state(
                 client, state, config.run_setup
             )
+            if progress_update is not None:
+                config = refresh_harness_config_from_progress(config)
             finalize_logged_run(config, state)
             memory_commit = maybe_commit_memory_checkpoint(
                 config, state, reason="run_end"
@@ -2887,7 +3233,9 @@ def resolve_auto_actions(
             time.sleep(wait)
         before = state
         before_fingerprint = _state_fingerprint(before)
-        state = _wait_for_play_phase(client)
+        state = _wait_for_post_action_state(
+            client, previous_state=before, previous_action=action
+        )
         record: JsonDict = {
             "action": action.as_dict(
                 actions.index(action) if action in actions else None
@@ -2954,6 +3302,9 @@ def command_snapshot(args: argparse.Namespace) -> int:
     state, auto_actions = resolve_auto_actions(client, state, config)
     actions = action_dicts(build_actions(state, config.run_setup))
     output: JsonDict = {"state": state, "actions": actions}
+    objective_battle_log = build_objective_battle_log(config, state)
+    if objective_battle_log is not None:
+        output["objective_battle_log"] = objective_battle_log
     if auto_actions:
         output["auto_actions"] = auto_actions
     progress_update = maybe_update_progress_after_state(client, state, config.run_setup)
@@ -3030,7 +3381,9 @@ def command_act(args: argparse.Namespace) -> int:
         if args.wait > 0:
             time.sleep(args.wait)
         try:
-            after = _wait_for_play_phase(client)
+            after = _wait_for_post_action_state(
+                client, previous_state=before, previous_action=action
+            )
             after, post_auto_actions = resolve_auto_actions(
                 client, after, config, previous_action=action
             )
@@ -3073,7 +3426,9 @@ def command_act(args: argparse.Namespace) -> int:
 
     if args.wait > 0:
         time.sleep(args.wait)
-    after = _wait_for_play_phase(client)
+    after = _wait_for_post_action_state(
+        client, previous_state=before, previous_action=action
+    )
     after, post_auto_actions = resolve_auto_actions(
         client, after, config, previous_action=action
     )

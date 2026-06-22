@@ -112,10 +112,10 @@ Example action:
 {"jsonrpc":"2.0","id":2,"method":"act","params":{"action":0}}
 ```
 
-Example memory write:
+Example memory rewrite:
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"append_memory","params":{"path":"BATTLE_LOG.md","content":"\nFloor 3: took 2 damage, added Strike+.\n"}}
+{"jsonrpc":"2.0","id":3,"method":"write_memory","params":{"path":"CURRENT_RUN.md","content":"# Current Run\n\nSeed: R58NTKJSSE, A0 Ironclad.\n\n## Plan\nMaintain the full active-run tactical sheet here.\n"}}
 ```
 
 ## Memory Git Worktrees
@@ -125,7 +125,8 @@ harness/RPC user. Configure:
 
 - `logging.memory_git_source`: the source memory repository.
 - `logging.memory_git_dir`: the per-condition worktree containing
-  `STRATEGY.md`, `CURRENT_RUN.md`, and `BATTLE_LOG.md`.
+  `STRATEGY.md`, `CURRENT_RUN.md`, `BATTLE_LOG.md`, and
+  `HARNESS_BUGS.md`.
 - `logging.memory_git_branch`: a stable branch name for this condition.
 - `logging.memory_git_init`: whether the harness may initialize the source repo
   if it does not exist.
@@ -148,7 +149,8 @@ commits the configured paths from the trusted side.
 - `list_memory`: lists files under `memory_root`.
 - `read_memory`: reads one memory file under `memory_root`.
 - `write_memory`: replaces one memory file under `memory_root`.
-- `append_memory`: appends to one memory file under `memory_root`.
+- `append_memory`: disabled; maintain memory through full-file `write_memory`
+  rewrites.
 - `record_model_telemetry`: records Pi orchestrator prompt/response hashes,
   full prompt/response payloads, token usage, request/response IDs, pricing
   metadata, and RPC tool-call counts against the latest logged agent step.
@@ -232,11 +234,42 @@ ChatGPT account can be used to create/manage Platform API keys if the account
 has API access and billing configured, but the orchestrator needs the API key,
 not the ChatGPT web session or Codex CLI login.
 
-### OpenCode Go / Other OpenAI-Compatible APIs
+### OpenCode Go
 
-Use `provider: "openai_compatible_chat"` if OpenCode Go, or another provider,
-gives you an OpenAI-compatible `/chat/completions` endpoint and API key. This
-also does not use the OpenCode CLI.
+Use `provider: "opencode_go"` to call OpenCode Go directly from the harness
+with an OpenCode Go API key. This does not use the OpenCode CLI or Pi extension.
+The provider defaults to `model: "deepseek-v4-flash"`,
+`api_key_env: "OPENCODE_API_KEY"`, and
+`base_url: "https://opencode.ai/zen/go/v1"`.
+
+Example:
+
+```json
+{
+  "model": {
+    "provider": "opencode_go",
+    "model": "deepseek-v4-flash",
+    "api_key_env": "OPENCODE_API_KEY",
+    "timeout": 300
+  }
+}
+```
+
+Set:
+
+```bash
+export OPENCODE_API_KEY='...'
+```
+
+The model name is the raw OpenCode Go API model ID. For example, the
+`pi-opencode-bridge` Pi package exposes this same model in Pi as
+`oc-sdk-go/deepseek-v4-flash`, where `oc-sdk-go` is the Pi provider prefix and
+`deepseek-v4-flash` is the API model ID used here.
+
+### Other OpenAI-Compatible APIs
+
+Use `provider: "openai_compatible_chat"` for other providers that expose an
+OpenAI-compatible `/chat/completions` endpoint and API key.
 
 Example:
 
@@ -258,9 +291,7 @@ Set:
 export OPENCODE_API_KEY='...'
 ```
 
-The model string and base URL depend on the provider. If OpenCode Go does not
-offer an OpenAI-compatible API endpoint, we need its actual API documentation
-before wiring it in.
+The model string, key environment variable, and base URL depend on the provider.
 
 ### OpenRouter / Kimi K2.6
 

@@ -12,7 +12,6 @@
     "base_url": "https://api.openai.com/v1",
     "timeout": 300
   },
-  "max_steps": 200,
   "stop_on_game_over": true,
   "decision_log": "pi_orchestrator/runs.local.jsonl",
   "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"

@@ -20,14 +20,21 @@
         "properties": {
           "path": {
             "type": "string",
-            "enum": ["STRATEGY.md", "CURRENT_RUN.md", "BATTLE_LOG.md"]
+            "enum": [
+              "STRATEGY.md",
+              "CURRENT_RUN.md",
+              "BATTLE_LOG.md",
+              "HARNESS_BUGS.md"
+            ]
           },
           "mode": {
             "type": "string",
-            "enum": ["append", "write"]
+            "enum": ["write"],
+            "description": "Always write the complete replacement contents of the file."
           },
           "content": {
-            "type": "string"
+            "type": "string",
+            "description": "Complete replacement file content, including the Markdown heading."
           }
         }
       }

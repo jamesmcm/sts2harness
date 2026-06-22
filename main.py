@@ -14,11 +14,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
 DEFAULT_BASE_URL = "http://localhost:15526"
-DEFAULT_MCP_DELAY = 1.0
+DEFAULT_MCP_DELAY = 0.25
 DEFAULT_THROTTLE_FILE = "/tmp/sts2harness-mcp-throttle"
 DEFAULT_CONFIG_FILE = "sts2harness.json"
 DEFAULT_PROGRESS_FILE = ".sts2harness-progress.json"
@@ -235,6 +236,35 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     return seeds
 
 
+def _read_seed_file(path: str | os.PathLike[str]) -> tuple[str, ...]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError as exc:
+        raise ValueError(f"seed_file not found: {path}") from exc
+    seeds: list[str] = []
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        seeds.append(text)
+    return tuple(seeds)
+
+
+def _configured_seed_set(run_config: JsonDict, config_path: str) -> tuple[str, ...]:
+    seed_set = _string_tuple(run_config.get("seed_set") or run_config.get("seeds"))
+    seed_file = _optional_str(run_config.get("seed_file"))
+    if seed_file is None:
+        return seed_set
+    path = Path(seed_file).expanduser()
+    if not path.is_absolute():
+        path = Path(config_path).expanduser().resolve().parent / path
+    file_seeds = _read_seed_file(path)
+    if seed_set:
+        return seed_set + file_seeds
+    return file_seeds
+
+
 def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
@@ -249,7 +279,7 @@ def load_harness_config(config_path: str) -> HarnessConfig:
         run_config = config
 
     seed = run_config.get("seed")
-    seed_set = _string_tuple(run_config.get("seed_set") or run_config.get("seeds"))
+    seed_set = _configured_seed_set(run_config, config_path)
     seed_policy = str(run_config.get("seed_policy") or DEFAULT_SEED_POLICY).strip()
     if seed_policy not in SEED_POLICIES:
         raise ValueError(
@@ -483,7 +513,12 @@ def _combat_like(state_type: str) -> bool:
     return state_type in {"monster", "elite", "boss"}
 
 
-def _wait_for_play_phase(client: Sts2Client, *, poll_interval: float = 0.5) -> JsonDict:
+def _wait_for_play_phase(
+    client: Sts2Client,
+    *,
+    poll_interval: float = 0.1,
+    max_wait: float = 20.0,
+) -> JsonDict:
     """Poll game state until we're in a valid actionable state.
 
     During combat the game goes through animation/transition periods where
@@ -491,20 +526,46 @@ def _wait_for_play_phase(client: Sts2Client, *, poll_interval: float = 0.5) -> J
     either rejected or silently dropped. This helper waits until the game
     settles into a state where actions are meaningful.
     """
+    deadline = time.monotonic() + max(0.0, max_wait)
+    last_state: JsonDict | None = None
     while True:
         state = client.get_state(response_format="json")
+        last_state = state
         state_type = str(state.get("state_type") or "")
 
         # Non-combat states are always actionable.
         if not _combat_like(state_type):
             return state
 
-        # Combat: only return when the player can actually act.
+        # Combat: only return when the player can actually act and the action
+        # builder can see a real choice. At turn boundaries STS2MCP can briefly
+        # report player play phase before the hand/enemy data has settled.
         battle = _battle(state)
-        if battle.get("is_play_phase") is True and battle.get("turn") == "player":
+        if (
+            battle.get("is_play_phase") is True
+            and battle.get("turn") == "player"
+            and _combat_snapshot_has_actionable_choices(state)
+        ):
             return state
 
-        time.sleep(poll_interval)
+        if time.monotonic() >= deadline:
+            return last_state
+
+        sleep_for = min(poll_interval, max(0.0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+
+def _combat_snapshot_has_actionable_choices(state: JsonDict) -> bool:
+    if _playable_hand_cards(state):
+        return True
+    if any(enemy.get("entity_id") for enemy in _alive_enemies(state)):
+        return True
+    player = _player(state)
+    battle = _battle(state)
+    if "hand" not in player and "enemies" not in battle:
+        return True
+    return False
 
 
 def build_actions(state: JsonDict, run_setup: RunSetup | None = None) -> list[Action]:
@@ -1054,6 +1115,7 @@ def _card_select_actions(state: JsonDict) -> list[Action]:
         return []
     actions: list[Action] = []
     screen_type = str(selection.get("screen_type") or "select")
+    has_selectable_cards = False
     if selection.get("preview_showing") is not True:
         for card in selection.get("cards") or []:
             if not isinstance(card, dict):
@@ -1061,6 +1123,7 @@ def _card_select_actions(state: JsonDict) -> list[Action]:
             index = card.get("index")
             if not isinstance(index, int):
                 continue
+            has_selectable_cards = True
             card_name = _name(card, "name", "id", fallback=f"card {index}")
             actions.append(
                 Action(
@@ -1070,15 +1133,8 @@ def _card_select_actions(state: JsonDict) -> list[Action]:
                     request={"action": "select_card", "index": index},
                 )
             )
-    if selection.get("can_confirm") is True:
-        actions.append(
-            Action(
-                id="deck_confirm_selection",
-                label=f"Confirm {screen_type} selection",
-                category="card_select",
-                request={"action": "confirm_selection"},
-            )
-        )
+    if selection.get("can_confirm") is True and not has_selectable_cards:
+        actions.append(_deck_confirm_action(screen_type))
     if selection.get("can_cancel") is True:
         actions.append(
             Action(
@@ -1089,6 +1145,15 @@ def _card_select_actions(state: JsonDict) -> list[Action]:
             )
         )
     return actions
+
+
+def _deck_confirm_action(screen_type: str) -> Action:
+    return Action(
+        id="deck_confirm_selection",
+        label=f"Confirm {screen_type} selection",
+        category="card_select",
+        request={"action": "confirm_selection"},
+    )
 
 
 def _choose_card_actions(state: JsonDict) -> list[Action]:
@@ -1329,6 +1394,90 @@ def _extract_run_ascension(run: JsonDict) -> int | None:
 def _extract_run_victory(run: JsonDict) -> bool:
     for key in ("victory", "win", "is_victory"):
         if run.get(key) is True:
+            return True
+    return False
+
+
+def _history_points(run: JsonDict) -> list[JsonDict]:
+    history = run.get("map_point_history")
+    if not isinstance(history, list):
+        return []
+    points: list[JsonDict] = []
+    for act in history:
+        if not isinstance(act, list):
+            continue
+        for point in act:
+            if isinstance(point, dict):
+                points.append(point)
+    return points
+
+
+def _history_rooms(run: JsonDict) -> list[JsonDict]:
+    rooms: list[JsonDict] = []
+    for point in _history_points(run):
+        point_rooms = point.get("rooms")
+        if not isinstance(point_rooms, list):
+            continue
+        for room in point_rooms:
+            if isinstance(room, dict):
+                rooms.append(room)
+    return rooms
+
+
+def _extract_history_floor(run: JsonDict) -> int | None:
+    floor = _extract_int(run, "floor", "floor_num", "floor_reached")
+    if floor is not None:
+        return floor
+    points = _history_points(run)
+    return len(points) if points else None
+
+
+def _extract_history_act(run: JsonDict) -> int | None:
+    act = _extract_int(run, "act", "act_num")
+    if act is not None:
+        return act
+    acts = run.get("acts")
+    return len(acts) if isinstance(acts, list) and acts else None
+
+
+def _meaningful_history_value(run: JsonDict, *keys: str) -> str | None:
+    for key in keys:
+        value = run.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.upper() not in {"NONE", "NONE.NONE", "NULL"}:
+            return text
+    return None
+
+
+def _extract_death_reason(history: JsonDict, state: JsonDict) -> str | None:
+    reason = _meaningful_history_value(
+        history, "death_reason", "killed_by_encounter", "killed_by_event"
+    )
+    if reason is not None:
+        return reason
+    reason = state.get("death_reason")
+    if reason is not None and str(reason).strip():
+        return str(reason).strip()
+    if history.get("was_abandoned") is True:
+        return "abandoned"
+    return None
+
+
+def _history_boss_reached(history: JsonDict) -> bool:
+    if history.get("boss_reached") is True:
+        return True
+    death = _meaningful_history_value(history, "killed_by_encounter")
+    if death is not None and "BOSS" in death.upper():
+        return True
+    for point in _history_points(history):
+        if str(point.get("map_point_type") or "").lower() == "boss":
+            return True
+    for room in _history_rooms(history):
+        room_type = str(room.get("room_type") or "").lower()
+        model_id = str(room.get("model_id") or "").upper()
+        if room_type == "boss" or "BOSS" in model_id:
             return True
     return False
 
@@ -1635,6 +1784,7 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
           total_model_calls INTEGER,
           total_input_tokens INTEGER,
           total_output_tokens INTEGER,
+          total_model_elapsed_seconds REAL,
           total_tool_calls INTEGER,
           total_cost REAL,
           total_prompt_cost REAL,
@@ -1679,9 +1829,12 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
           completion_cost REAL,
           native_tokens_prompt INTEGER,
           native_tokens_completion INTEGER,
+          model_elapsed_seconds REAL,
           generation_stats_json TEXT,
           generation_content_json TEXT,
           tool_calls TEXT,
+          invalid_action_ref TEXT,
+          invalid_action_error TEXT,
           timestamp TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS run_summaries (
@@ -1704,6 +1857,7 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
             "total_completion_cost": "REAL",
             "total_native_tokens_prompt": "INTEGER",
             "total_native_tokens_completion": "INTEGER",
+            "total_model_elapsed_seconds": "REAL",
         },
     )
     _ensure_columns(
@@ -1724,8 +1878,12 @@ def _init_log_db(conn: sqlite3.Connection) -> None:
             "completion_cost": "REAL",
             "native_tokens_prompt": "INTEGER",
             "native_tokens_completion": "INTEGER",
+            "model_elapsed_seconds": "REAL",
             "generation_stats_json": "TEXT",
             "generation_content_json": "TEXT",
+            "tool_calls": "TEXT",
+            "invalid_action_ref": "TEXT",
+            "invalid_action_error": "TEXT",
         },
     )
     conn.commit()
@@ -2202,8 +2360,9 @@ def log_invalid_action(
         INSERT INTO steps (
           run_id, step_index, floor, room_type, state_type, hp, max_hp, gold,
           deck_size, relic_count, potion_count, legal_actions, action_chosen,
-          action_source, observation_hash, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          action_source, observation_hash, invalid_action_ref,
+          invalid_action_error, timestamp
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -2221,6 +2380,8 @@ def log_invalid_action(
             json.dumps(chosen, sort_keys=True),
             "invalid_agent",
             hashlib.sha256(observation_json.encode("utf-8")).hexdigest(),
+            action_ref,
+            error,
             _now_utc(),
         ),
     )
@@ -2260,6 +2421,7 @@ def record_model_telemetry(
     generation_content: JsonDict | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    model_elapsed_seconds: float | None = None,
     tool_calls: JsonDict | list[Any] | None = None,
     model_calls: int = 1,
 ) -> JsonDict:
@@ -2307,6 +2469,7 @@ def record_model_telemetry(
             completion_cost = COALESCE(?, completion_cost),
             native_tokens_prompt = COALESCE(?, native_tokens_prompt),
             native_tokens_completion = COALESCE(?, native_tokens_completion),
+            model_elapsed_seconds = COALESCE(?, model_elapsed_seconds),
             generation_stats_json = COALESCE(?, generation_stats_json),
             generation_content_json = COALESCE(?, generation_content_json),
             tool_calls = COALESCE(?, tool_calls)
@@ -2329,6 +2492,7 @@ def record_model_telemetry(
             completion_cost,
             native_tokens_prompt,
             native_tokens_completion,
+            model_elapsed_seconds,
             _json_or_none(generation_stats),
             _json_or_none(generation_content),
             tool_calls_json,
@@ -2348,7 +2512,8 @@ def record_model_telemetry(
             total_prompt_cost = COALESCE(total_prompt_cost, 0) + ?,
             total_completion_cost = COALESCE(total_completion_cost, 0) + ?,
             total_native_tokens_prompt = COALESCE(total_native_tokens_prompt, 0) + ?,
-            total_native_tokens_completion = COALESCE(total_native_tokens_completion, 0) + ?
+            total_native_tokens_completion = COALESCE(total_native_tokens_completion, 0) + ?,
+            total_model_elapsed_seconds = COALESCE(total_model_elapsed_seconds, 0) + ?
         WHERE run_id = ?
         """,
         (
@@ -2361,6 +2526,7 @@ def record_model_telemetry(
             float(completion_cost or 0.0),
             max(0, int(native_tokens_prompt or 0)),
             max(0, int(native_tokens_completion or 0)),
+            max(0.0, float(model_elapsed_seconds or 0.0)),
             run_id,
         ),
     )
@@ -2372,6 +2538,7 @@ def record_model_telemetry(
         "step_id": row[0],
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "model_elapsed_seconds": model_elapsed_seconds,
         "total_cost": total_cost,
         "tool_calls": tool_count,
     }
@@ -2404,6 +2571,120 @@ def _tool_call_count(tool_calls: JsonDict | list[Any] | None) -> int:
     return count
 
 
+def _logged_boss_reached(conn: sqlite3.Connection, run_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM steps
+        WHERE run_id = ? AND (
+          lower(COALESCE(room_type, '')) = 'boss'
+          OR lower(COALESCE(state_type, '')) = 'boss'
+        )
+        LIMIT 1
+        """,
+        (run_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _state_boss_reached(state: JsonDict) -> bool:
+    return (
+        str(_state_room_type(state) or "").lower() == "boss"
+        or str(state.get("state_type") or "").lower() == "boss"
+    )
+
+
+def _format_run_harness_summary(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    floor: int | None,
+    act: int | None,
+    victory: bool,
+    death_reason: str | None,
+    boss_reached: bool,
+) -> str:
+    row = conn.execute(
+        """
+        SELECT COUNT(*), COALESCE(MAX(step_index), -1),
+               SUM(CASE WHEN action_source = 'agent' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN action_source = 'auto' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN action_source = 'invalid_agent' THEN 1 ELSE 0 END)
+        FROM steps WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    step_rows = int(row[0] or 0) if row else 0
+    max_step = int(row[1] or -1) if row else -1
+    agent_actions = int(row[2] or 0) if row else 0
+    auto_actions = int(row[3] or 0) if row else 0
+    invalid_actions = int(row[4] or 0) if row else 0
+    status = "victory" if victory else "loss"
+    location = f"act {act}, floor {floor}"
+    if act is None and floor is None:
+        location = "unknown location"
+    elif act is None:
+        location = f"floor {floor}"
+    elif floor is None:
+        location = f"act {act}"
+    reason = f"; death_reason={death_reason}" if death_reason else ""
+    boss = "; boss reached" if boss_reached else "; boss not reached"
+    return (
+        f"Run ended in {status} at {location}{reason}{boss}. "
+        f"Logged {step_rows} step rows through step {max_step}: "
+        f"{agent_actions} agent actions, {auto_actions} auto actions, "
+        f"{invalid_actions} invalid agent actions."
+    )
+
+
+def _write_run_summary(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    floor: int | None,
+    act: int | None,
+    victory: bool,
+    death_reason: str | None,
+    boss_reached: bool,
+) -> None:
+    harness_summary = _format_run_harness_summary(
+        conn,
+        run_id,
+        floor=floor,
+        act=act,
+        victory=victory,
+        death_reason=death_reason,
+        boss_reached=boss_reached,
+    )
+    invalid_actions = conn.execute(
+        """
+        SELECT COUNT(*) FROM steps
+        WHERE run_id = ? AND action_source = 'invalid_agent'
+        """,
+        (run_id,),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO run_summaries (
+          run_id, harness_summary, notable_mistakes, notable_successes, timestamp
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+          harness_summary = excluded.harness_summary,
+          notable_mistakes = COALESCE(run_summaries.notable_mistakes, excluded.notable_mistakes),
+          notable_successes = COALESCE(run_summaries.notable_successes, excluded.notable_successes),
+          timestamp = excluded.timestamp
+        """,
+        (
+            run_id,
+            harness_summary,
+            "Invalid agent actions occurred; query steps where action_source='invalid_agent'."
+            if int(invalid_actions or 0) > 0
+            else None,
+            "Reached the boss." if boss_reached else None,
+            _now_utc(),
+        ),
+    )
+
+
 def finalize_logged_run(config: HarnessConfig, state: JsonDict) -> None:
     conn = _connect_log_db(config)
     run_id = _progress_current_run_id(config)
@@ -2418,7 +2699,14 @@ def finalize_logged_run(config: HarnessConfig, state: JsonDict) -> None:
     victory = _extract_run_victory(history)
     floor = _state_floor(state)
     if floor is None:
-        floor = _extract_int(history, "floor", "floor_num", "floor_reached")
+        floor = _extract_history_floor(history)
+    act = _state_act(state) or _extract_history_act(history)
+    death_reason = _extract_death_reason(history, state)
+    boss_reached = (
+        _history_boss_reached(history)
+        or _state_boss_reached(state)
+        or _logged_boss_reached(conn, run_id)
+    )
     conn.execute(
         """
         UPDATE runs
@@ -2429,12 +2717,21 @@ def finalize_logged_run(config: HarnessConfig, state: JsonDict) -> None:
         (
             _now_utc(),
             floor,
-            _state_act(state) or _extract_int(history, "act", "act_num"),
-            1 if bool(history.get("boss_reached")) else 0,
+            act,
+            1 if boss_reached else 0,
             1 if victory else 0,
-            history.get("death_reason") or state.get("death_reason"),
+            death_reason,
             run_id,
         ),
+    )
+    _write_run_summary(
+        conn,
+        run_id,
+        floor=floor,
+        act=act,
+        victory=victory,
+        death_reason=death_reason,
+        boss_reached=boss_reached,
     )
     conn.commit()
     conn.close()
@@ -2448,10 +2745,32 @@ def _extract_int(value: JsonDict, *keys: str) -> int | None:
     return None
 
 
-def auto_action_for_state(state: JsonDict, actions: list[Action]) -> Action | None:
+def auto_action_for_state(
+    state: JsonDict,
+    actions: list[Action],
+    run_setup: RunSetup | None = None,
+    previous_action: Action | None = None,
+) -> Action | None:
     enabled_actions = [action for action in actions if action.enabled]
-    if not enabled_actions or state.get("state_type") == "game_over":
+    if not enabled_actions and state.get("state_type") != "card_select":
         return None
+    if (
+        state.get("state_type") == "card_select"
+        and previous_action is not None
+        and previous_action.category == "card_select"
+        and previous_action.request.get("action") == "select_card"
+    ):
+        selection = state.get("card_select")
+        if isinstance(selection, dict) and selection.get("can_confirm") is True:
+            return _deck_confirm_action(str(selection.get("screen_type") or "select"))
+    if state.get("state_type") == "game_over":
+        return next(
+            (action for action in enabled_actions if action.id == "menu:main_menu"),
+            None,
+        )
+    menu_action = _auto_menu_action_for_setup(state, enabled_actions, run_setup)
+    if menu_action is not None:
+        return menu_action
     if state.get("state_type") == "rewards":
         for action in enabled_actions:
             if action.id.startswith("rewards_claim:") and "gold" in action.label:
@@ -2472,6 +2791,45 @@ def auto_action_for_state(state: JsonDict, actions: list[Action]) -> Action | No
     return None
 
 
+def _auto_menu_action_for_setup(
+    state: JsonDict, actions: list[Action], run_setup: RunSetup | None
+) -> Action | None:
+    if run_setup is None or state.get("state_type") != "menu":
+        return None
+    if _load_json_file(run_setup.progress_file).get("stopped") is True:
+        return None
+    if not (run_setup.seed or run_setup.ascension is not None or run_setup.character):
+        return None
+
+    menu_screen = str(state.get("menu_screen") or "").lower()
+    selected_character = state.get("selected_character")
+    has_selected_character = isinstance(selected_character, dict) and bool(
+        selected_character.get("id")
+    )
+
+    if menu_screen in {"main", "main_menu", "start", ""}:
+        return _first_action_with_option(actions, {"singleplayer", "single player"})
+    if menu_screen == "singleplayer":
+        return _first_action_with_option(actions, {"custom"})
+    if menu_screen == "custom_run":
+        if run_setup.character and not has_selected_character:
+            character_action = _first_action_with_option(actions, {run_setup.character})
+            if character_action is not None:
+                return character_action
+        if not run_setup.character or has_selected_character:
+            return _first_action_with_option(actions, {"confirm", "embark"})
+    return None
+
+
+def _first_action_with_option(actions: list[Action], options: set[str]) -> Action | None:
+    normalized = {option.lower() for option in options}
+    for action in actions:
+        option = str(action.request.get("option") or "").lower()
+        if option in normalized:
+            return action
+    return None
+
+
 def _state_summary(state: JsonDict) -> JsonDict:
     player = _player(state)
     summary: JsonDict = {
@@ -2488,33 +2846,77 @@ def _state_summary(state: JsonDict) -> JsonDict:
     return summary
 
 
+def _state_fingerprint(state: JsonDict) -> str:
+    return json.dumps(state, sort_keys=True, ensure_ascii=False, default=str)
+
+
 def resolve_auto_actions(
     client: Sts2Client,
     state: JsonDict,
     config: HarnessConfig,
     *,
     wait: float = 0.5,
+    previous_action: Action | None = None,
 ) -> tuple[JsonDict, list[JsonDict]]:
     if not config.auto_resolve:
         return state, []
     auto_actions: list[JsonDict] = []
     for _ in range(max(0, config.max_auto_actions)):
         actions = build_actions(state, config.run_setup)
-        action = auto_action_for_state(state, actions)
+        action = auto_action_for_state(
+            state, actions, config.run_setup, previous_action
+        )
         if action is None:
             break
+        previous_action = None
+        progress_update = None
+        memory_commit = None
+        if state.get("state_type") == "game_over":
+            progress_update = maybe_update_progress_after_state(
+                client, state, config.run_setup
+            )
+            finalize_logged_run(config, state)
+            memory_commit = maybe_commit_memory_checkpoint(
+                config, state, reason="run_end"
+            )
+        start_action = action.request.get("action") == "menu_select" and str(
+            action.request.get("option") or ""
+        ).lower() in {"confirm", "embark"}
         result = client.post_action(action.request)
-        log_step(config, state, actions, action, action_source="auto")
         if wait > 0:
             time.sleep(wait)
+        before = state
+        before_fingerprint = _state_fingerprint(before)
         state = _wait_for_play_phase(client)
-        auto_actions.append(
-            {
-                "action": action.as_dict(actions.index(action)),
-                "result": result,
-                "state_after": _state_summary(state),
-            }
-        )
+        record: JsonDict = {
+            "action": action.as_dict(
+                actions.index(action) if action in actions else None
+            ),
+            "result": result,
+            "state_after": _state_summary(state),
+        }
+        if progress_update is not None:
+            record["progress_update"] = progress_update
+        if memory_commit is not None:
+            record["memory_commit"] = memory_commit
+        if start_action:
+            verification = verify_started_run_setup(action, config.run_setup)
+            if verification is not None:
+                record["run_setup_verification"] = verification
+                log_start = start_logged_run(config, state, verification)
+                if log_start is not None:
+                    record["run_log"] = log_start
+                    log_step(config, before, actions, action, action_source="auto")
+        elif action.category != "menu":
+            log_step(config, before, actions, action, action_source="auto")
+        auto_actions.append(record)
+        if _state_fingerprint(state) == before_fingerprint:
+            record["no_progress"] = True
+            record["error"] = (
+                "Auto action returned without changing the game state; "
+                "stopping auto-resolution to avoid a confirmation loop."
+            )
+            break
     return state, auto_actions
 
 
@@ -2629,7 +3031,9 @@ def command_act(args: argparse.Namespace) -> int:
             time.sleep(args.wait)
         try:
             after = _wait_for_play_phase(client)
-            after, post_auto_actions = resolve_auto_actions(client, after, config)
+            after, post_auto_actions = resolve_auto_actions(
+                client, after, config, previous_action=action
+            )
             output["state"] = after
             output["actions"] = action_dicts(build_actions(after, config.run_setup))
             if post_auto_actions:
@@ -2670,7 +3074,9 @@ def command_act(args: argparse.Namespace) -> int:
     if args.wait > 0:
         time.sleep(args.wait)
     after = _wait_for_play_phase(client)
-    after, post_auto_actions = resolve_auto_actions(client, after, config)
+    after, post_auto_actions = resolve_auto_actions(
+        client, after, config, previous_action=action
+    )
     output["state"] = after
     output["actions"] = action_dicts(build_actions(after, config.run_setup))
     if post_auto_actions:
@@ -2748,7 +3154,7 @@ def build_parser() -> argparse.ArgumentParser:
     act_parser.add_argument(
         "--wait",
         type=float,
-        default=2.0,
+        default=0.25,
         help="Seconds to wait before reading the next state.",
     )
     act_parser.set_defaults(func=command_act)

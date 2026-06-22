@@ -1,12 +1,16 @@
+import io
 import unittest
 import json
 import os
 import sqlite3
 import subprocess
 import tempfile
+import urllib.error
+from unittest import mock
 from pathlib import Path
 
 import main
+from pi_orchestrator import orchestrator
 
 
 class FakeClient:
@@ -55,7 +59,1019 @@ class WaitForPlayPhaseTests(unittest.TestCase):
         self.assertEqual(client.calls, 3)
 
 
+class PiOrchestratorConfigTests(unittest.TestCase):
+    def test_opencode_go_provider_defaults_to_deepseek_flash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orchestrator.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+                        "model": {"provider": "opencode_go"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = orchestrator.load_config(path)
+
+        self.assertEqual(config.model.provider, "opencode_go")
+        self.assertEqual(config.model.model, "deepseek-v4-flash")
+        self.assertIsNone(config.max_steps)
+
+    def test_max_steps_is_optional_positive_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orchestrator.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+                        "model": {"provider": "opencode_go"},
+                        "max_steps": 12,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = orchestrator.load_config(path)
+
+        self.assertEqual(config.max_steps, 12)
+
+    def test_opencode_go_provider_uses_go_endpoint_and_key_env_defaults(self):
+        old_key = os.environ.get("OPENCODE_API_KEY")
+        os.environ["OPENCODE_API_KEY"] = "test-key"
+        try:
+            provider = orchestrator.make_provider(
+                orchestrator.ModelConfig(
+                    provider="opencode_go",
+                    model="deepseek-v4-flash",
+                )
+            )
+        finally:
+            if old_key is None:
+                os.environ.pop("OPENCODE_API_KEY", None)
+            else:
+                os.environ["OPENCODE_API_KEY"] = old_key
+
+        self.assertIsInstance(provider, orchestrator.OpenCodeGoProvider)
+        self.assertEqual(provider.config.base_url, "https://opencode.ai/zen/go/v1")
+        self.assertEqual(provider.config.api_key_env, "OPENCODE_API_KEY")
+        self.assertEqual(provider.config.response_format, "json_object")
+
+    def test_opencode_go_provider_reads_bridge_auth_file(self):
+        old_home = os.environ.get("HOME")
+        old_key = os.environ.pop("OPENCODE_API_KEY", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                auth_path = (
+                    Path(tmp) / ".local" / "share" / "opencode" / "auth.json"
+                )
+                auth_path.parent.mkdir(parents=True)
+                auth_path.write_text(
+                    json.dumps({"opencode-go": {"type": "api", "key": "file-key"}}),
+                    encoding="utf-8",
+                )
+
+                provider = orchestrator.make_provider(
+                    orchestrator.ModelConfig(
+                        provider="opencode_go",
+                        model="deepseek-v4-flash",
+                    )
+                )
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+            if old_key is not None:
+                os.environ["OPENCODE_API_KEY"] = old_key
+
+        self.assertEqual(provider.api_key, "file-key")
+
+
+class FakeChatProvider(orchestrator.OpenAICompatibleChatProvider):
+    def __init__(self, config, responses):
+        self.config = config
+        self.schema = {"type": "object"}
+        self.api_key = "test-key"
+        self.responses = list(responses)
+        self.payloads = []
+
+    def _post_json(self, url, payload):
+        del url
+        self.payloads.append(payload)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class PiOrchestratorResponseFormatTests(unittest.TestCase):
+    def test_openai_compatible_defaults_to_json_schema(self):
+        provider = FakeChatProvider(
+            orchestrator.ModelConfig(
+                provider="openai_compatible_chat",
+                model="model",
+                base_url="https://example.test/v1",
+            ),
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"action_ref":"0","rationale":"ok"}'
+                            }
+                        }
+                    ]
+                }
+            ],
+        )
+
+        provider.complete_json("prompt")
+
+        self.assertEqual(
+            provider.payloads[0]["response_format"]["type"], "json_schema"
+        )
+
+    def test_json_schema_unavailable_falls_back_to_json_object(self):
+        provider = FakeChatProvider(
+            orchestrator.ModelConfig(
+                provider="openai_compatible_chat",
+                model="model",
+                base_url="https://example.test/v1",
+            ),
+            [
+                RuntimeError(
+                    "model API HTTP 400: response_format type is unavailable now"
+                ),
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"action_ref":"0","rationale":"ok"}'
+                            }
+                        }
+                    ]
+                },
+            ],
+        )
+
+        completion = provider.complete_json("prompt")
+
+        self.assertEqual(completion.decision["action_ref"], "0")
+        self.assertEqual(provider.payloads[0]["response_format"]["type"], "json_schema")
+        self.assertEqual(provider.payloads[1]["response_format"]["type"], "json_object")
+
+    def test_configured_none_omits_response_format(self):
+        provider = FakeChatProvider(
+            orchestrator.ModelConfig(
+                provider="openai_compatible_chat",
+                model="model",
+                base_url="https://example.test/v1",
+                response_format="none",
+            ),
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"action_ref":"0","rationale":"ok"}'
+                            }
+                        }
+                    ]
+                }
+            ],
+        )
+
+        provider.complete_json("prompt")
+
+        self.assertNotIn("response_format", provider.payloads[0])
+
+
+class FakeHttpResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return None
+
+    def read(self):
+        return self.body
+
+
+class RetryHttpProvider(orchestrator.HttpJsonProvider):
+    def __init__(self, retry_backoffs):
+        self.config = orchestrator.ModelConfig(
+            provider="openai_compatible_chat",
+            model="model",
+            retry_backoffs=tuple(retry_backoffs),
+        )
+        self.schema = {"type": "object"}
+        self.api_key = "test-key"
+
+
+class PiOrchestratorHttpRetryTests(unittest.TestCase):
+    def test_post_json_retries_transient_http_error(self):
+        provider = RetryHttpProvider((1.5,))
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            calls.append(request)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    503,
+                    "Service Unavailable",
+                    {},
+                    io.BytesIO(b"busy"),
+                )
+            return FakeHttpResponse(b'{"ok": true}')
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("time.sleep") as sleep:
+                response = provider._post_json("https://example.test/v1", {"x": 1})
+
+        self.assertEqual(response, {"ok": True})
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(1.5)
+
+    def test_post_json_preserves_final_http_error_body(self):
+        provider = RetryHttpProvider((0,))
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            raise urllib.error.HTTPError(
+                request.full_url,
+                503,
+                "Service Unavailable",
+                {},
+                io.BytesIO(b"still down"),
+            )
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaisesRegex(RuntimeError, "model API HTTP 503: still down"):
+                provider._post_json("https://example.test/v1", {"x": 1})
+
+
+class MalformedJsonProvider(orchestrator.ModelProvider):
+    def __init__(self, failures_before_success=None):
+        self.calls = 0
+        self.failures_before_success = failures_before_success
+
+    def complete_json(self, prompt):
+        del prompt
+        self.calls += 1
+        if (
+            self.failures_before_success is not None
+            and self.calls > self.failures_before_success
+        ):
+            return orchestrator.ModelCompletion(
+                decision={"action_ref": "0", "rationale": "ok"},
+                raw_response={"ok": True},
+                response_text='{"action_ref":"0","rationale":"ok"}',
+                request_payload={"model": "x"},
+            )
+        raise orchestrator.ModelResponseFormatError(
+            "model returned invalid decision JSON: bad",
+            raw_response={"bad": True, "call": self.calls},
+            response_text='{"action_ref":"0", "memory_updates": [}',
+            request_payload={"model": "x"},
+        )
+
+
+class PiOrchestratorModelResponseRetryTests(unittest.TestCase):
+    def _config(self, log_path):
+        return orchestrator.OrchestratorConfig(
+            rpc_server_command=["python", "pi_agent/rpc_server.py"],
+            model=orchestrator.ModelConfig(provider="openai_responses", model="x"),
+            decision_log=str(log_path),
+        )
+
+    def test_invalid_model_json_is_retried_and_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "decisions.jsonl"
+            provider = MalformedJsonProvider(failures_before_success=1)
+
+            with mock.patch("time.sleep") as sleep:
+                completion = orchestrator.complete_with_response_retries(
+                    provider,
+                    self._config(log_path),
+                    "prompt",
+                    7,
+                )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(provider.calls, 2)
+        sleep.assert_called_once_with(orchestrator.MODEL_DECISION_PARSE_RETRY_DELAY)
+        self.assertEqual(completion.decision["action_ref"], "0")
+        self.assertEqual(records[0]["event"], "invalid_model_json")
+        self.assertFalse(records[0]["final_attempt"])
+
+    def test_invalid_model_json_final_attempt_returns_rejected_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "decisions.jsonl"
+            provider = MalformedJsonProvider()
+
+            with mock.patch("time.sleep"):
+                completion = orchestrator.complete_with_response_retries(
+                    provider,
+                    self._config(log_path),
+                    "prompt",
+                    8,
+                )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(provider.calls, orchestrator.MODEL_DECISION_PARSE_RETRIES + 1)
+        self.assertEqual(completion.decision["action_ref"], "")
+        self.assertIn('"memory_updates"', completion.response_text)
+        self.assertTrue(records[-1]["final_attempt"])
+
+
+class FakeRpc:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def call(self, method, params):
+        self.calls.append((method, params))
+        if method != "snapshot":
+            raise AssertionError(f"unexpected method: {method}")
+        if len(self.responses) > 1:
+            return self.responses.pop(0)
+        return self.responses[0]
+
+
+class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
+    def _config(self, log_path, **overrides):
+        values = {
+            "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+            "model": orchestrator.ModelConfig(provider="openai_responses", model="x"),
+            "decision_log": str(log_path),
+            "empty_action_poll_interval": 0,
+        }
+        values.update(overrides)
+        return orchestrator.OrchestratorConfig(**values)
+
+    def test_snapshot_with_actions_retries_empty_action_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeRpc(
+                [
+                    {"state": {"state_type": "event"}, "actions": []},
+                    {
+                        "state": {"state_type": "event"},
+                        "actions": [{"id": "event:0"}],
+                    },
+                ]
+            )
+
+            snapshot, state, actions = orchestrator.snapshot_with_actions(
+                rpc, self._config(Path(tmp) / "decisions.jsonl"), 3
+            )
+
+        self.assertEqual(snapshot["state"]["state_type"], "event")
+        self.assertEqual(state["state_type"], "event")
+        self.assertEqual(actions, [{"id": "event:0"}])
+        self.assertEqual(len(rpc.calls), 2)
+
+    def test_snapshot_with_actions_times_out_after_empty_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpc = FakeRpc([{"state": {"state_type": "event"}, "actions": []}])
+
+            with self.assertRaisesRegex(RuntimeError, "no legal actions"):
+                orchestrator.snapshot_with_actions(
+                    rpc,
+                    self._config(
+                        Path(tmp) / "decisions.jsonl",
+                        empty_action_max_wait=0,
+                    ),
+                    3,
+                )
+
+    def test_memory_updates_are_full_writes_to_known_note_files(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+                if method == "read_memory":
+                    return {"content": "# Existing\n\n" + ("Useful prior context.\n" * 5)}
+                return {"status": "ok"}
+
+        rpc = FakeRpc()
+        current_run_content = (
+            "# Current Run\n\n"
+            + ("Deck, relic, potion, path, risk, and tactic detail.\n" * 35)
+        )
+        written = orchestrator.apply_memory_updates(
+            rpc,
+            {
+                "memory_updates": [
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "mode": "write",
+                        "content": current_run_content,
+                    },
+                    {
+                        "path": "HARNESS_BUGS.md",
+                        "mode": "write",
+                        "content": "# Harness Bugs\n\nHarness issue.\n",
+                    },
+                    {
+                        "path": "STRATEGY.md",
+                        "mode": "append",
+                        "content": "\nIgnored append.\n",
+                    },
+                    {
+                        "path": "other.md",
+                        "mode": "write",
+                        "content": "Ignored.",
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(written, {"CURRENT_RUN.md", "HARNESS_BUGS.md"})
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "read_memory",
+                    {
+                        "path": "CURRENT_RUN.md",
+                    },
+                ),
+                (
+                    "write_memory",
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "content": current_run_content,
+                    },
+                ),
+                (
+                    "read_memory",
+                    {
+                        "path": "HARNESS_BUGS.md",
+                    },
+                ),
+                (
+                    "write_memory",
+                    {
+                        "path": "HARNESS_BUGS.md",
+                        "content": "# Harness Bugs\n\nHarness issue.\n",
+                    },
+                )
+            ],
+        )
+
+    def test_memory_write_requires_successful_preread(self):
+        class FakeRpc:
+            def call(self, method, params=None):
+                del params
+                if method == "read_memory":
+                    return {"error": "missing content"}
+                raise AssertionError("write should not happen without preread content")
+
+        with self.assertRaisesRegex(RuntimeError, "could not read current"):
+            orchestrator.apply_memory_updates(
+                FakeRpc(),
+                {
+                    "memory_updates": [
+                        {
+                            "path": "HARNESS_BUGS.md",
+                            "mode": "write",
+                            "content": "# Harness Bugs\n\nBug note.\n",
+                        }
+                    ]
+                },
+            )
+
+    def test_finished_battle_requires_current_run_rewrite_before_advancing(self):
+        snapshot = {
+            "state": {
+                "state_type": "rewards",
+                "battle": {"enemies": [{"name": "Jaw Worm", "hp": 0}]},
+            },
+            "actions": [{"id": "0"}],
+        }
+        memory = {
+            "BATTLE_LOG.md": "# Battle Log\n\nKilled Jaw Worm. Took 8. Bash was key.\n"
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {"action_ref": "0"}, snapshot, memory
+        )
+
+        self.assertIn("rewrite CURRENT_RUN.md", error)
+
+    def test_rewards_without_dead_enemy_evidence_does_not_require_current_run_rewrite(self):
+        snapshot = {"state": {"state_type": "rewards"}, "actions": [{"id": "0"}]}
+        memory = {
+            "BATTLE_LOG.md": "# Battle Log\n\nPossibly stale combat note.\n"
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {"action_ref": "0"}, snapshot, memory
+        )
+
+        self.assertIsNone(error)
+
+    def test_combat_hand_select_does_not_require_current_run_rewrite(self):
+        snapshot = {
+            "state": {
+                "state_type": "hand_select",
+                "battle": {"is_play_phase": True, "turn": "player"},
+                "hand_select": {"prompt": "Choose a card to Exhaust."},
+            },
+            "actions": [{"id": "combat_select_card:0"}],
+        }
+        memory = {
+            "BATTLE_LOG.md": "# Battle Log\n\nPlayed True Grit+; exhaust Defend.\n"
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {"action_ref": "0"}, snapshot, memory
+        )
+
+        self.assertIsNone(error)
+
+    def test_finished_battle_lifecycle_prompt_warns_battle_log_will_be_cleared(self):
+        snapshot = {
+            "state": {
+                "state_type": "rewards",
+                "battle": {"enemies": [{"name": "Jaw Worm", "dead": True}]},
+            },
+            "actions": [{"id": "0"}],
+        }
+        memory = {
+            "BATTLE_LOG.md": "# Battle Log\n\nKilled Jaw Worm. Took 8. Bash was key.\n"
+        }
+
+        requirement = orchestrator.build_lifecycle_requirement(snapshot, memory)
+
+        self.assertIn("complete battle outcome", requirement)
+        self.assertIn("only persistent context for this run", requirement)
+        self.assertIn("do not make a sparse summary", requirement)
+        self.assertIn("same prompt's `Memory` section", requirement)
+        self.assertIn("preserve every useful lesson from `BATTLE_LOG.md`", requirement)
+        self.assertIn("clear `BATTLE_LOG.md`", requirement)
+        self.assertIn("must stand on its own", requirement)
+
+    def test_finished_battle_accepts_current_run_rewrite(self):
+        snapshot = {
+            "state": {
+                "state_type": "rewards",
+                "battle": {"enemies": [{"name": "Jaw Worm", "is_dead": True}]},
+            },
+            "actions": [{"id": "0"}],
+        }
+        memory = {
+            "BATTLE_LOG.md": "# Battle Log\n\nKilled Jaw Worm. Took 8. Bash was key.\n"
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {
+                "action_ref": "0",
+                "memory_updates": [
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "mode": "write",
+                        "content": "# Current Run\n\nFolded combat details.\n",
+                    }
+                ],
+            },
+            snapshot,
+            memory,
+        )
+
+        self.assertIsNone(error)
+
+    def test_game_over_requires_strategy_rewrite_before_advancing(self):
+        snapshot = {
+            "state": {"state_type": "game_over"},
+            "actions": [{"id": "menu:main_menu"}],
+            "progress_update": {"last_completed_victory": False},
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {
+                "action_ref": "menu:main_menu",
+                "memory_updates": [
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "mode": "write",
+                        "content": "# Current Run\n\nNot enough.\n",
+                    }
+                ],
+            },
+            snapshot,
+            {},
+        )
+
+        self.assertIn("rewrite STRATEGY.md", error)
+
+    def test_game_over_lifecycle_prompt_warns_current_run_will_be_cleared(self):
+        snapshot = {
+            "state": {"state_type": "game_over"},
+            "actions": [{"id": "menu:main_menu"}],
+            "progress_update": {"last_completed_victory": False},
+        }
+
+        requirement = orchestrator.build_lifecycle_requirement(snapshot, {})
+
+        self.assertIn("comprehensive lessons from the completed run", requirement)
+        self.assertIn("only persistent cross-run playbook", requirement)
+        self.assertIn("do not make a sparse summary", requirement)
+        self.assertIn("same prompt's `Memory` section", requirement)
+        self.assertIn("why it died", requirement)
+        self.assertIn("clear `CURRENT_RUN.md`", requirement)
+        self.assertIn("must stand on its own", requirement)
+
+    def test_game_over_accepts_strategy_rewrite(self):
+        snapshot = {
+            "state": {"state_type": "game_over"},
+            "actions": [{"id": "menu:main_menu"}],
+            "progress_update": {"last_completed_victory": False},
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {
+                "action_ref": "menu:main_menu",
+                "memory_updates": [
+                    {
+                        "path": "STRATEGY.md",
+                        "mode": "write",
+                        "content": "# Strategy\n\nAvoid the line that died.\n",
+                    }
+                ],
+            },
+            snapshot,
+            {},
+        )
+
+        self.assertIsNone(error)
+
+    def test_short_current_run_rewrite_is_accepted(self):
+        error = orchestrator.validate_memory_quality(
+            {
+                "action_ref": "0",
+                "memory_updates": [
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "mode": "write",
+                        "content": "# Current Run\n\nToo short.\n",
+                    }
+                ],
+            },
+            {"state": {"state_type": "map"}},
+            {
+                "CURRENT_RUN.md": "# Current Run\n\n"
+                + ("Existing useful context.\n" * 90)
+            },
+        )
+
+        self.assertIsNone(error)
+
+    def test_short_strategy_rewrite_is_accepted(self):
+        error = orchestrator.validate_memory_quality(
+            {
+                "action_ref": "0",
+                "memory_updates": [
+                    {
+                        "path": "STRATEGY.md",
+                        "mode": "write",
+                        "content": "# Strategy Memory\n\nOne lesson.\n",
+                    }
+                ],
+            },
+            {"state": {"state_type": "game_over"}},
+            {"STRATEGY.md": "# Strategy Memory\n\n"},
+        )
+
+        self.assertIsNone(error)
+
+    def test_comprehensive_memory_rewrite_is_accepted(self):
+        long_current_run = (
+            "# Current Run\n\n"
+            "## State\n"
+            + ("Deck, relic, potion, path, risk, and tactic detail.\n" * 35)
+        )
+
+        error = orchestrator.validate_memory_quality(
+            {
+                "action_ref": "0",
+                "memory_updates": [
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "mode": "write",
+                        "content": long_current_run,
+                    }
+                ],
+            },
+            {"state": {"state_type": "map"}},
+            {"CURRENT_RUN.md": "# Current Run\n\nExisting full run state.\n"},
+        )
+
+        self.assertIsNone(error)
+
+    def test_build_prompt_does_not_warn_when_persistent_memory_is_short(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {"state": {"state_type": "map"}, "actions": []},
+                {
+                    "CURRENT_RUN.md": "# Current Run\n\nShort.\n",
+                    "STRATEGY.md": "# Strategy Memory\n\nShort.\n",
+                },
+            )
+
+        self.assertNotIn("Memory quality requirement:", prompt)
+        self.assertNotIn("currently sparse", prompt)
+        self.assertNotIn("at least 1400 chars", prompt)
+        self.assertNotIn("at least 1200 chars", prompt)
+
+    def test_build_prompt_inserts_full_memory_files_into_same_prompt(self):
+        current_run = "# Current Run\n\nFull active run state.\n"
+        strategy = "# Strategy Memory\n\nFull durable playbook.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {"state": {"state_type": "map"}, "actions": []},
+                {
+                    "CURRENT_RUN.md": current_run,
+                    "STRATEGY.md": strategy,
+                },
+            )
+
+        self.assertIn('"CURRENT_RUN.md"', prompt)
+        self.assertIn("Full active run state.", prompt)
+        self.assertIn('"STRATEGY.md"', prompt)
+        self.assertIn("Full durable playbook.", prompt)
+
+    def test_refinement_prompt_contains_full_memory_files_in_same_prompt(self):
+        current_run = "# Current Run\n\nFull run details before reward.\n"
+        battle_log = "# Battle Log\n\nFull battle tactics to fold in.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {
+                    "state": {
+                        "state_type": "rewards",
+                        "battle": {"enemies": [{"name": "Jaw Worm", "hp": 0}]},
+                    },
+                    "actions": [{"id": "0"}],
+                },
+                {
+                    "CURRENT_RUN.md": current_run,
+                    "BATTLE_LOG.md": battle_log,
+                    "STRATEGY.md": "# Strategy Memory\n\nDurable lessons.\n",
+                },
+            )
+
+        self.assertIn("Lifecycle requirement:", prompt)
+        self.assertIn("rewrite `CURRENT_RUN.md`", prompt)
+        self.assertIn('"CURRENT_RUN.md"', prompt)
+        self.assertIn("Full run details before reward.", prompt)
+        self.assertIn('"BATTLE_LOG.md"', prompt)
+        self.assertIn("Full battle tactics to fold in.", prompt)
+        self.assertIn("same prompt's `Memory` section", prompt)
+
+    def test_current_run_rewrite_out_of_combat_clears_battle_log(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+
+        rpc = FakeRpc()
+
+        records = orchestrator.enforce_memory_lifecycle(
+            rpc,
+            {
+                "state": {
+                    "state_type": "rewards",
+                    "battle": {"enemies": [{"name": "Jaw Worm", "hp": 0}]},
+                }
+            },
+            {"CURRENT_RUN.md"},
+        )
+
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "write_memory",
+                    {
+                        "path": "BATTLE_LOG.md",
+                        "content": orchestrator.MEMORY_FILE_TEMPLATES[
+                            "BATTLE_LOG.md"
+                        ],
+                    },
+                )
+            ],
+        )
+        self.assertEqual(
+            records,
+            [
+                {
+                    "path": "BATTLE_LOG.md",
+                    "reason": "current_run_rewritten_after_battle",
+                }
+            ],
+        )
+
+    def test_current_run_rewrite_in_combat_keeps_battle_log(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+
+        rpc = FakeRpc()
+
+        records = orchestrator.enforce_memory_lifecycle(
+            rpc,
+            {"state": {"state_type": "monster"}},
+            {"CURRENT_RUN.md"},
+        )
+
+        self.assertEqual(rpc.calls, [])
+        self.assertEqual(records, [])
+
+    def test_current_run_rewrite_in_combat_hand_select_keeps_battle_log(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+
+        rpc = FakeRpc()
+
+        records = orchestrator.enforce_memory_lifecycle(
+            rpc,
+            {
+                "state": {
+                    "state_type": "hand_select",
+                    "battle": {"is_play_phase": True, "turn": "player"},
+                }
+            },
+            {"CURRENT_RUN.md"},
+        )
+
+        self.assertEqual(rpc.calls, [])
+        self.assertEqual(records, [])
+
+    def test_strategy_rewrite_after_death_resets_run_notes(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+
+        rpc = FakeRpc()
+
+        records = orchestrator.enforce_memory_lifecycle(
+            rpc,
+            {
+                "state": {"state_type": "game_over"},
+                "progress_update": {"last_completed_victory": False},
+            },
+            {"STRATEGY.md"},
+        )
+
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "write_memory",
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "content": orchestrator.MEMORY_FILE_TEMPLATES[
+                            "CURRENT_RUN.md"
+                        ],
+                    },
+                ),
+                (
+                    "write_memory",
+                    {
+                        "path": "BATTLE_LOG.md",
+                        "content": orchestrator.MEMORY_FILE_TEMPLATES[
+                            "BATTLE_LOG.md"
+                        ],
+                    },
+                ),
+            ],
+        )
+        self.assertEqual(
+            records,
+            [
+                {
+                    "path": "CURRENT_RUN.md",
+                    "reason": "strategy_rewritten_after_death",
+                },
+                {
+                    "path": "BATTLE_LOG.md",
+                    "reason": "strategy_rewritten_after_death",
+                },
+            ],
+        )
+
+    def test_next_decision_step_resumes_existing_jsonl_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step": 0, "event": "start"}),
+                        "not json",
+                        json.dumps({"step": 199, "action_ref": "0"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            step = orchestrator.next_decision_step(str(path))
+
+        self.assertEqual(step, 200)
+
+
 class RunSetupActionTests(unittest.TestCase):
+    def test_opencode_trial_seed_file_preserves_existing_valid_prefix(self):
+        existing = Path(
+            "seed_sets/opencode_go_deepseek_v4_flash_valid_20260607.txt"
+        ).read_text(encoding="utf-8").splitlines()
+        trial = Path(
+            "seed_sets/opencode_go_deepseek_v4_flash_trial_20260618.txt"
+        ).read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(len(existing), 20)
+        self.assertEqual(len(trial), 100)
+        self.assertEqual(trial[: len(existing)], existing)
+        self.assertEqual(len(set(trial)), len(trial))
+        for seed in trial:
+            self.assertEqual(len(seed), 10)
+            self.assertTrue(seed.isalnum())
+            self.assertEqual(seed, seed.upper())
+
+    def test_seed_file_loads_ordered_seed_set(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seed_file = Path(tmpdir) / "seeds.txt"
+            seed_file.write_text("# comment\nS1\n\nS2\nS3\n", encoding="utf-8")
+            config_file = Path(tmpdir) / "harness.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "run_setup": {
+                            "seed_policy": "fixed_list_until_win",
+                            "seed_file": "seeds.txt",
+                            "ascension": 0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            setup = main.load_run_setup(str(config_file))
+
+        self.assertEqual(setup.seed_set, ("S1", "S2", "S3"))
+        self.assertEqual(setup.seed, "S1")
+
     def test_custom_confirm_uses_harness_seed_and_ascension(self):
         state = {
             "state_type": "menu",
@@ -117,6 +1133,102 @@ class RunSetupActionTests(unittest.TestCase):
         self.assertEqual(
             [action.id for action in actions], ["menu:custom", "menu:back"]
         )
+
+    def test_game_over_exposes_main_menu_restart_action(self):
+        actions = main.build_actions({"state_type": "game_over"})
+
+        self.assertEqual([action.id for action in actions], ["menu:main_menu"])
+        self.assertEqual(
+            actions[0].request, {"action": "menu_select", "option": "main_menu"}
+        )
+
+    def test_auto_resolve_restarts_and_starts_configured_seeded_custom_run(self):
+        class FakeActionClient:
+            def __init__(self):
+                self.requests = []
+                self.states = [
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "main_menu",
+                        "options": [{"name": "singleplayer", "enabled": True}],
+                    },
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "singleplayer",
+                        "options": [{"name": "custom", "enabled": True}],
+                    },
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "custom_run",
+                        "options": [{"name": "IRONCLAD", "enabled": True}],
+                    },
+                    {
+                        "state_type": "menu",
+                        "menu_screen": "custom_run",
+                        "selected_character": {"id": "IRONCLAD"},
+                        "options": [{"name": "confirm", "enabled": True}],
+                    },
+                    {
+                        "state_type": "monster",
+                        "battle": {"is_play_phase": True, "turn": "player"},
+                    },
+                ]
+
+            def post_action(self, request):
+                self.requests.append(request)
+                return {"status": "ok"}
+
+            def get_state(self, *, response_format="json"):
+                del response_format
+                return self.states.pop(0)
+
+        old_verify = main.verify_started_run_setup
+        try:
+            main.verify_started_run_setup = lambda action, setup: {
+                "status": "ok",
+                "expected": {"seed": setup.seed, "ascension": setup.ascension},
+            }
+            with tempfile.TemporaryDirectory() as tmpdir:
+                config = main.HarnessConfig(
+                    run_setup=main.RunSetup(
+                        seed="S1",
+                        ascension=0,
+                        character="IRONCLAD",
+                        progress_file=str(Path(tmpdir) / "progress.json"),
+                        save_root=tmpdir,
+                    ),
+                    auto_resolve=True,
+                    max_auto_actions=5,
+                )
+                client = FakeActionClient()
+
+                state, auto_actions = main.resolve_auto_actions(
+                    client,
+                    {"state_type": "game_over"},
+                    config,
+                    wait=0,
+                )
+        finally:
+            main.verify_started_run_setup = old_verify
+
+        self.assertEqual(state["state_type"], "monster")
+        self.assertEqual(
+            client.requests,
+            [
+                {"action": "menu_select", "option": "main_menu"},
+                {"action": "menu_select", "option": "singleplayer"},
+                {"action": "menu_select", "option": "custom"},
+                {"action": "menu_select", "option": "IRONCLAD"},
+                {
+                    "action": "menu_select",
+                    "option": "confirm",
+                    "seed": "S1",
+                    "ascension": 0,
+                },
+            ],
+        )
+        self.assertEqual(len(auto_actions), 5)
+        self.assertEqual(auto_actions[-1]["run_setup_verification"]["status"], "ok")
 
 
 class ActionGenerationTests(unittest.TestCase):
@@ -189,6 +1301,70 @@ class ActionGenerationTests(unittest.TestCase):
 
         self.assertIsNotNone(action)
         self.assertEqual(action.request, {"action": "claim_reward", "index": 0})
+
+    def test_card_select_confirm_is_hidden_when_cards_are_visible(self):
+        state = {
+            "state_type": "card_select",
+            "card_select": {
+                "screen_type": "NDeckEnchantSelectScreen",
+                "cards": [{"index": 0, "name": "Bash"}],
+                "preview_showing": False,
+                "can_confirm": True,
+            },
+        }
+
+        actions = main.build_actions(state)
+
+        self.assertEqual([action.id for action in actions], ["deck_select_card:0"])
+
+    def test_post_card_select_auto_confirm_stops_on_no_progress(self):
+        state = {
+            "state_type": "card_select",
+            "card_select": {
+                "screen_type": "NDeckEnchantSelectScreen",
+                "cards": [{"index": 0, "name": "Bash"}],
+                "preview_showing": False,
+                "can_confirm": True,
+            },
+        }
+
+        class FakeClient:
+            def __init__(self):
+                self.requests = []
+
+            def post_action(self, request):
+                self.requests.append(request)
+                return {"status": "ok", "message": "Confirming selection"}
+
+            def get_state(self, *, response_format="json"):
+                del response_format
+                return state
+
+        previous_action = main.Action(
+            id="deck_select_card:0",
+            label="Select NDeckEnchantSelectScreen card[0] Bash",
+            category="card_select",
+            request={"action": "select_card", "index": 0},
+        )
+        client = FakeClient()
+
+        after, auto_actions = main.resolve_auto_actions(
+            client,
+            state,
+            main.HarnessConfig(
+                run_setup=main.RunSetup(), auto_resolve=True, max_auto_actions=5
+            ),
+            wait=0,
+            previous_action=previous_action,
+        )
+
+        self.assertIs(after, state)
+        self.assertEqual(client.requests, [{"action": "confirm_selection"}])
+        self.assertEqual(len(auto_actions), 1)
+        self.assertEqual(
+            auto_actions[0]["action"]["request"], {"action": "confirm_selection"}
+        )
+        self.assertTrue(auto_actions[0]["no_progress"])
 
 
 class ProgressTests(unittest.TestCase):
@@ -266,6 +1442,39 @@ class ProgressTests(unittest.TestCase):
             progress = main._load_json_file(progress_file)
             self.assertEqual(progress["consecutive_a10_wins"], 3)
             self.assertTrue(progress["stopped"])
+
+    def test_fixed_list_until_win_retries_same_seed_after_death(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            progress_file = str(Path(tmpdir) / "progress.json")
+            history = Path(tmpdir) / "saves" / "history"
+            history.mkdir(parents=True)
+            (history / "run1.run").write_text(
+                json.dumps(
+                    {
+                        "run_id": "run-1",
+                        "seed": "S1",
+                        "ascension": 0,
+                        "victory": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            setup = main.RunSetup(
+                seed_set=("S1", "S2", "S3"),
+                ascension=0,
+                progress_file=progress_file,
+                save_root=tmpdir,
+                seed_policy="fixed_list_until_win",
+            )
+
+            update = main.maybe_update_progress_after_state(
+                FakeClient([]), {"state_type": "game_over"}, setup
+            )
+
+            self.assertEqual(update["next_seed_index"], 0)
+            progress = main._load_json_file(progress_file)
+            self.assertNotIn("current_seed_index", progress)
+            self.assertEqual(main.current_seed_for_setup(setup, progress), "S1")
 
     def test_stop_after_current_run_marks_progress_stopped(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -604,13 +1813,100 @@ class InvalidActionLoggingTests(unittest.TestCase):
                 (start["run_id"],),
             ).fetchone()
             step_row = conn.execute(
-                "SELECT action_source, action_chosen FROM steps WHERE run_id = ?",
+                """
+                SELECT action_source, action_chosen, invalid_action_ref,
+                       invalid_action_error
+                FROM steps WHERE run_id = ?
+                """,
                 (start["run_id"],),
             ).fetchone()
             conn.close()
             self.assertEqual(run_row[0], 1)
             self.assertEqual(step_row[0], "invalid_agent")
             self.assertIn("play_card:7", step_row[1])
+            self.assertEqual(step_row[2], "play_card:7")
+            self.assertEqual(step_row[3], "not legal")
+
+    def test_finalize_logged_run_fills_history_fields_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = str(Path(tmpdir) / "runs.sqlite")
+            progress_file = str(Path(tmpdir) / "progress.json")
+            history = Path(tmpdir) / "saves" / "history"
+            history.mkdir(parents=True)
+            (history / "run1.run").write_text(
+                json.dumps(
+                    {
+                        "start_time": 123,
+                        "seed": "S1",
+                        "ascension": 0,
+                        "win": False,
+                        "acts": ["ACT.ONE", "ACT.TWO"],
+                        "killed_by_encounter": "ENCOUNTER.TEST_BOSS",
+                        "killed_by_event": "NONE.NONE",
+                        "map_point_history": [
+                            [
+                                {
+                                    "map_point_type": "monster",
+                                    "rooms": [{"room_type": "monster"}],
+                                }
+                            ],
+                            [
+                                {
+                                    "map_point_type": "boss",
+                                    "rooms": [
+                                        {
+                                            "room_type": "boss",
+                                            "model_id": "ENCOUNTER.TEST_BOSS",
+                                        }
+                                    ],
+                                }
+                            ],
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = main.HarnessConfig(
+                run_setup=main.RunSetup(
+                    seed="S1",
+                    ascension=0,
+                    progress_file=progress_file,
+                    save_root=tmpdir,
+                ),
+                agent=main.AgentConfig(
+                    agent_name="agent",
+                    model_name="model",
+                    condition_name="condition",
+                ),
+                logging=main.LoggingConfig(
+                    sqlite_path=sqlite_path,
+                    official_run_logging=True,
+                ),
+            )
+            start = main.start_logged_run(config, {"state_type": "monster"}, None)
+
+            main.finalize_logged_run(config, {"state_type": "game_over"})
+
+            conn = sqlite3.connect(sqlite_path)
+            run_row = conn.execute(
+                """
+                SELECT final_floor, act, boss_reached, victory, death_reason
+                FROM runs WHERE run_id = ?
+                """,
+                (start["run_id"],),
+            ).fetchone()
+            summary_row = conn.execute(
+                """
+                SELECT harness_summary FROM run_summaries WHERE run_id = ?
+                """,
+                (start["run_id"],),
+            ).fetchone()
+            conn.close()
+
+            self.assertEqual(run_row, (2, 2, 1, 0, "ENCOUNTER.TEST_BOSS"))
+            self.assertIsNotNone(summary_row)
+            self.assertIn("Run ended in loss", summary_row[0])
+            self.assertIn("boss reached", summary_row[0])
 
 
 class ModelTelemetryLoggingTests(unittest.TestCase):
@@ -654,7 +1950,17 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
                 response_hash="response-hash",
                 prompt_text="full prompt",
                 response_text="full response",
-                raw_response={"id": "gen-1", "choices": []},
+                raw_response={
+                    "id": "gen-1",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "full response",
+                                "reasoning_content": "reasoning trace",
+                            }
+                        }
+                    ],
+                },
                 request_payload={"model": "model"},
                 provider_name="OpenRouter",
                 request_id="req-1",
@@ -670,9 +1976,10 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
                 generation_content={"data": {"output": {"completion": "full response"}}},
                 input_tokens=123,
                 output_tokens=45,
+                model_elapsed_seconds=3.0,
                 tool_calls={
                     "snapshot": 1,
-                    "memory_reads": 3,
+                    "memory_reads": 4,
                     "memory_writes": 2,
                     "act": 1,
                 },
@@ -685,7 +1992,7 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
                 SELECT total_model_calls, total_input_tokens, total_output_tokens,
                        total_tool_calls, total_cost, total_prompt_cost,
                        total_completion_cost, total_native_tokens_prompt,
-                       total_native_tokens_completion
+                       total_native_tokens_completion, total_model_elapsed_seconds
                 FROM runs WHERE run_id = ?
                 """,
                 (start["run_id"],),
@@ -697,25 +2004,28 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
                        provider_name, request_id, response_id, generation_id,
                        upstream_id, total_cost, prompt_cost, completion_cost,
                        native_tokens_prompt, native_tokens_completion,
-                       generation_stats_json, generation_content_json
+                       model_elapsed_seconds, generation_stats_json,
+                       generation_content_json
                 FROM steps WHERE run_id = ?
                 """,
                 (start["run_id"],),
             ).fetchone()
             conn.close()
 
-            self.assertEqual(run_row[:4], (1, 123, 45, 7))
+            self.assertEqual(run_row[:4], (1, 123, 45, 8))
             self.assertAlmostEqual(run_row[4], 0.012)
             self.assertAlmostEqual(run_row[5], 0.004)
             self.assertAlmostEqual(run_row[6], 0.008)
             self.assertEqual(run_row[7], 100)
             self.assertEqual(run_row[8], 50)
+            self.assertAlmostEqual(run_row[9], 3.0)
             self.assertEqual(step_row[0], "prompt-hash")
             self.assertEqual(step_row[1], "response-hash")
             self.assertIn('"memory_writes": 2', step_row[2])
             self.assertEqual(step_row[3], "full prompt")
             self.assertEqual(step_row[4], "full response")
             self.assertIn('"id": "gen-1"', step_row[5])
+            self.assertIn('"reasoning_content": "reasoning trace"', step_row[5])
             self.assertIn('"model": "model"', step_row[6])
             self.assertEqual(step_row[7], "OpenRouter")
             self.assertEqual(step_row[8], "req-1")
@@ -727,8 +2037,9 @@ class ModelTelemetryLoggingTests(unittest.TestCase):
             self.assertAlmostEqual(step_row[14], 0.008)
             self.assertEqual(step_row[15], 100)
             self.assertEqual(step_row[16], 50)
-            self.assertIn('"total_cost": 0.012', step_row[17])
-            self.assertIn('"completion": "full response"', step_row[18])
+            self.assertAlmostEqual(step_row[17], 3.0)
+            self.assertIn('"total_cost": 0.012', step_row[18])
+            self.assertIn('"completion": "full response"', step_row[19])
 
     def test_record_model_telemetry_can_attach_to_invalid_agent_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:

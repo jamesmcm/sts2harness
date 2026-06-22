@@ -1,3 +1,4 @@
 # Battle Log
 
-Append compact combat summaries here after important fights.
+Temporary scratchpad for the current battle only. Rewrite during combat, then
+fold useful lessons into `CURRENT_RUN.md` and clear this file after combat.

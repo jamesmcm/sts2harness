@@ -3,16 +3,15 @@
     "python",
     "pi_agent/rpc_server.py",
     "--config",
-    "/var/lib/sts2harness/official/pi_agent.json"
+    "pi_agent/config/pi_agent.opencode-go.local.json"
   ],
   "model": {
     "provider": "opencode_go",
     "model": "deepseek-v4-flash",
     "api_key_env": "OPENCODE_API_KEY",
-    "base_url": "https://opencode.ai/zen/go/v1",
     "timeout": 300
   },
-  "stop_on_game_over": true,
-  "decision_log": "/var/lib/sts2harness/agents/pi-agent/decisions.jsonl",
+  "stop_on_game_over": false,
+  "decision_log": "pi_orchestrator/runs.opencode-go.local.jsonl",
   "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"
 }

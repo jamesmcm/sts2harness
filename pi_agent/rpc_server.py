@@ -26,7 +26,7 @@ class PiAgentConfig:
     base_url: str = harness.DEFAULT_BASE_URL
     timeout: float = 30.0
     mcp_delay: float = harness.DEFAULT_MCP_DELAY
-    wait_after_action: float = 2.0
+    wait_after_action: float = 0.25
 
 
 def _load_json(path: str) -> JsonDict:
@@ -45,7 +45,7 @@ def load_pi_config(path: str) -> PiAgentConfig:
         base_url=str(config.get("base_url") or harness.DEFAULT_BASE_URL),
         timeout=float(config.get("timeout", 30.0)),
         mcp_delay=float(config.get("mcp_delay", harness.DEFAULT_MCP_DELAY)),
-        wait_after_action=float(config.get("wait_after_action", 2.0)),
+        wait_after_action=float(config.get("wait_after_action", 0.25)),
     )
 
 
@@ -105,9 +105,11 @@ class PiRpcServer:
     def snapshot(self, params: JsonDict) -> JsonDict:
         del params
         state = harness._wait_for_play_phase(self.client)
-        state, auto_actions = harness.resolve_auto_actions(
-            self.client, state, self.harness_config
-        )
+        auto_actions: list[JsonDict] = []
+        if state.get("state_type") != "game_over":
+            state, auto_actions = harness.resolve_auto_actions(
+                self.client, state, self.harness_config
+            )
         actions = harness.build_actions(state, self.harness_config.run_setup)
         output: JsonDict = {
             "state": state,
@@ -121,12 +123,6 @@ class PiRpcServer:
         if progress_update is not None:
             output["progress_update"] = progress_update
         harness.finalize_logged_run(self.harness_config, state)
-        if state.get("state_type") == "game_over":
-            memory_commit = harness.maybe_commit_memory_checkpoint(
-                self.harness_config, state, reason="run_end"
-            )
-            if memory_commit is not None:
-                output["memory_commit"] = memory_commit
         return output
 
     def act(self, params: JsonDict) -> JsonDict:
@@ -134,9 +130,11 @@ class PiRpcServer:
             raise ValueError("act requires an action index or ID in params.action")
         action_ref = str(params["action"])
         before = harness._wait_for_play_phase(self.client)
-        before, pre_auto_actions = harness.resolve_auto_actions(
-            self.client, before, self.harness_config
-        )
+        pre_auto_actions: list[JsonDict] = []
+        if before.get("state_type") != "game_over":
+            before, pre_auto_actions = harness.resolve_auto_actions(
+                self.client, before, self.harness_config
+            )
         actions = harness.build_actions(before, self.harness_config.run_setup)
         try:
             action = harness.find_action(actions, action_ref)
@@ -174,19 +172,33 @@ class PiRpcServer:
             harness.log_step(
                 self.harness_config, before, actions, action, action_source="agent"
             )
+        run_end_progress_update = None
+        run_end_memory_commit = None
+        if before.get("state_type") == "game_over":
+            run_end_progress_update = harness.maybe_update_progress_after_state(
+                self.client, before, self.harness_config.run_setup
+            )
+            harness.finalize_logged_run(self.harness_config, before)
+            run_end_memory_commit = harness.maybe_commit_memory_checkpoint(
+                self.harness_config, before, reason="run_end"
+            )
         result = self.client.post_action(action.request)
         wait = float(params.get("wait", self.config.wait_after_action))
         output: JsonDict = {
             "action": action.as_dict(actions.index(action)),
             "result": result,
         }
+        if run_end_progress_update is not None:
+            output["progress_update"] = run_end_progress_update
+        if run_end_memory_commit is not None:
+            output["memory_commit"] = run_end_memory_commit
         if pre_auto_actions:
             output["pre_auto_actions"] = pre_auto_actions
         if wait > 0:
             time.sleep(wait)
         after = harness._wait_for_play_phase(self.client)
         after, post_auto_actions = harness.resolve_auto_actions(
-            self.client, after, self.harness_config
+            self.client, after, self.harness_config, previous_action=action
         )
         output["state"] = after
         output["actions"] = harness.action_dicts(
@@ -254,12 +266,8 @@ class PiRpcServer:
         return {"status": "ok", "path": str(path.relative_to(self.memory_root))}
 
     def append_memory(self, params: JsonDict) -> JsonDict:
-        path = self._safe_path(str(params["path"]))
-        content = str(params.get("content") or "")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(content)
-        return {"status": "ok", "path": str(path.relative_to(self.memory_root))}
+        del params
+        raise ValueError("append_memory is disabled; use write_memory with full file content")
 
     def record_model_telemetry(self, params: JsonDict) -> JsonDict:
         tool_calls = params.get("tool_calls")
@@ -289,6 +297,9 @@ class PiRpcServer:
             generation_content=_optional_json_object(params.get("generation_content")),
             input_tokens=_optional_int(params.get("input_tokens")),
             output_tokens=_optional_int(params.get("output_tokens")),
+            model_elapsed_seconds=_optional_float(
+                params.get("model_elapsed_seconds")
+            ),
             tool_calls=tool_calls,
             model_calls=int(params.get("model_calls", 1)),
         )

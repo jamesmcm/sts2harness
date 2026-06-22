@@ -1,4 +1,4 @@
 # Strategy Memory
 
-Persistent global strategy notes for the Pi agent.
-
+Rewrite this file as durable cross-run strategy notes: card/relic evaluations,
+pathing principles, boss lessons, and mistakes to avoid.

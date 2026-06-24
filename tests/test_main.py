@@ -11,6 +11,7 @@ from unittest import mock
 from pathlib import Path
 
 import main
+from pi_agent import rpc_server
 from pi_orchestrator import orchestrator
 
 
@@ -167,6 +168,77 @@ class WaitForPlayPhaseTests(unittest.TestCase):
         self.assertEqual(client.calls, 2)
 
 
+class PiRpcPostActionWaitTests(unittest.TestCase):
+    def test_act_uses_post_action_readiness_wait(self):
+        server = rpc_server.PiRpcServer.__new__(rpc_server.PiRpcServer)
+        server.config = rpc_server.PiAgentConfig(
+            harness_config="unused.json",
+            memory_root="unused",
+            wait_after_action=0,
+        )
+        server.harness_config = mock.Mock(
+            run_setup=None,
+            auto_resolve=False,
+        )
+        server.client = mock.Mock()
+        before = {"state_type": "monster"}
+        after = {"state_type": "monster"}
+        action = main.Action(
+            id="end_turn",
+            label="End turn",
+            category="combat",
+            request={"action": "end_turn"},
+        )
+        server.client.post_action.return_value = {"status": "ok"}
+
+        with (
+            mock.patch.object(server, "_reload_harness_config"),
+            mock.patch.object(rpc_server.harness, "_wait_for_play_phase", return_value=before),
+            mock.patch.object(
+                rpc_server.harness,
+                "_wait_for_post_action_state",
+                return_value=after,
+            ) as wait_for_post_action,
+            mock.patch.object(
+                rpc_server.harness,
+                "resolve_auto_actions",
+                side_effect=[(before, []), (after, [])],
+            ),
+            mock.patch.object(rpc_server.harness, "build_actions", return_value=[action]),
+            mock.patch.object(rpc_server.harness, "find_action", return_value=action),
+            mock.patch.object(rpc_server.harness, "log_step"),
+            mock.patch.object(
+                rpc_server.harness,
+                "refresh_harness_config_from_progress",
+                return_value=server.harness_config,
+            ),
+            mock.patch.object(rpc_server.harness, "action_dicts", return_value=[]),
+            mock.patch.object(
+                rpc_server.harness,
+                "maybe_update_progress_after_state",
+                return_value=None,
+            ),
+            mock.patch.object(rpc_server.harness, "finalize_logged_run"),
+            mock.patch.object(
+                rpc_server.harness,
+                "maybe_commit_memory_checkpoint",
+                return_value=None,
+            ),
+            mock.patch.object(
+                rpc_server.harness,
+                "verify_started_run_setup",
+                return_value=None,
+            ),
+        ):
+            server.act({"action": "end_turn", "wait": 0})
+
+        wait_for_post_action.assert_called_once_with(
+            server.client,
+            previous_state=before,
+            previous_action=action,
+        )
+
+
 class PiOrchestratorConfigTests(unittest.TestCase):
     def test_opencode_go_provider_defaults_to_deepseek_flash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -204,6 +276,30 @@ class PiOrchestratorConfigTests(unittest.TestCase):
             config = orchestrator.load_config(path)
 
         self.assertEqual(config.max_steps, 12)
+
+    def test_agent_context_config_defaults_off_and_loads_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orchestrator.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+                        "model": {"provider": "opencode_go"},
+                        "agent_context": {
+                            "enabled": True,
+                            "compaction_token_threshold": 1234,
+                            "prompt_cache": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = orchestrator.load_config(path)
+
+        self.assertTrue(config.agent_context.enabled)
+        self.assertEqual(config.agent_context.compaction_token_threshold, 1234)
+        self.assertTrue(config.agent_context.prompt_cache)
 
     def test_opencode_go_provider_uses_go_endpoint_and_key_env_defaults(self):
         old_key = os.environ.get("OPENCODE_API_KEY")
@@ -355,6 +451,22 @@ class PiOrchestratorResponseFormatTests(unittest.TestCase):
         provider.complete_json("prompt")
 
         self.assertNotIn("response_format", provider.payloads[0])
+
+    def test_cached_prompt_tokens_are_parsed_from_usage_details(self):
+        completion = orchestrator._completion_from_text(
+            {
+                "usage": {
+                    "prompt_tokens": 2000,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 1536},
+                }
+            },
+            '{"action_ref":"0","rationale":"ok"}',
+            {"model": "x"},
+        )
+
+        self.assertEqual(completion.input_tokens, 2000)
+        self.assertEqual(completion.cached_input_tokens, 1536)
 
 
 class FakeHttpResponse:
@@ -826,9 +938,22 @@ class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
         self.assertIn("only persistent cross-run playbook", requirement)
         self.assertIn("do not make a sparse summary", requirement)
         self.assertIn("same prompt's `Memory` section", requirement)
-        self.assertIn("why it died", requirement)
+        self.assertIn("whether it won or died", requirement)
         self.assertIn("clear `CURRENT_RUN.md`", requirement)
         self.assertIn("must stand on its own", requirement)
+
+    def test_victory_requires_strategy_rewrite_before_advancing(self):
+        snapshot = {
+            "state": {"state_type": "game_over"},
+            "actions": [{"id": "menu:main_menu"}],
+            "progress_update": {"last_completed_victory": True},
+        }
+
+        error = orchestrator.validate_memory_lifecycle(
+            {"action_ref": "menu:main_menu"}, snapshot, {}
+        )
+
+        self.assertIn("rewrite STRATEGY.md", error)
 
     def test_game_over_accepts_strategy_rewrite(self):
         snapshot = {
@@ -996,6 +1121,307 @@ class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
         self.assertIn('"BATTLE_LOG.md"', prompt)
         self.assertIn("Full battle tactics to fold in.", prompt)
         self.assertIn("same prompt's `Memory` section", prompt)
+        self.assertLess(prompt.index("Lifecycle requirement:"), prompt.rindex("Snapshot:"))
+
+    def test_build_prompt_keeps_snapshot_and_objective_battle_log_last(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {
+                    "state": {"state_type": "monster"},
+                    "actions": [{"id": "0"}],
+                    "objective_battle_log": [
+                        {"action": "Bash", "before": {"energy": 3}}
+                    ],
+                },
+                {"BATTLE_LOG.md": "# Battle Log\n\nActive notes.\n"},
+            )
+
+        self.assertLess(prompt.index("Memory:"), prompt.index("Snapshot:"))
+        snapshot_text = prompt.split("Snapshot:", 1)[1].split(
+            "Objective battle log:", 1
+        )[0]
+        self.assertNotIn("objective_battle_log", snapshot_text)
+        self.assertIn('"state_type": "monster"', snapshot_text)
+        self.assertTrue(
+            prompt.rstrip().endswith(
+                '"before": {\n'
+                '      "energy": 3\n'
+                "    }\n"
+                "  }\n"
+                "]"
+            )
+        )
+
+    def test_agent_context_routes_active_battle_to_battle_tactician(self):
+        role = orchestrator.context_role_for_snapshot(
+            {
+                "state": {
+                    "state_type": "monster",
+                    "battle": {"is_play_phase": True, "turn": "player"},
+                },
+                "actions": [{"id": "0"}],
+            },
+            {},
+        )
+
+        self.assertEqual(role, "battle_tactician")
+
+    def test_agent_context_keeps_finished_battle_with_tactician_until_folded(self):
+        role = orchestrator.context_role_for_snapshot(
+            {
+                "state": {
+                    "state_type": "rewards",
+                    "battle": {"enemies": [{"name": "Jaw Worm", "hp": 0}]},
+                },
+                "actions": [{"id": "0"}],
+            },
+            {"BATTLE_LOG.md": "# Battle Log\n\nWon with Bash line.\n"},
+        )
+
+        self.assertEqual(role, "battle_tactician")
+
+    def test_agent_context_routes_map_to_map_pather(self):
+        role = orchestrator.context_role_for_snapshot(
+            {"state": {"state_type": "map"}, "actions": [{"id": "map:0"}]},
+            {"BATTLE_LOG.md": orchestrator.MEMORY_FILE_TEMPLATES["BATTLE_LOG.md"]},
+        )
+
+        self.assertEqual(role, "map_pather")
+
+    def test_agent_context_compaction_requires_role_memory_rewrite(self):
+        manager = orchestrator.AgentContextManager(
+            orchestrator.AgentContextConfig(
+                enabled=True,
+                compaction_token_threshold=1,
+            )
+        )
+
+        prompt, exchange_prompt, conversation, context = manager.build_prompt(
+            "Memory:\n{}\nSnapshot:\n{}", "battle_tactician"
+        )
+
+        self.assertIn("Context compaction requirement:", prompt)
+        self.assertIn("Context compaction requirement:", exchange_prompt)
+        self.assertLess(
+            prompt.index("Context compaction requirement:"), prompt.rindex("Snapshot:")
+        )
+        self.assertLess(
+            exchange_prompt.index("Context compaction requirement:"),
+            exchange_prompt.rindex("Snapshot:"),
+        )
+        self.assertEqual(context["compaction_path"], "BATTLE_LOG.md")
+        error = orchestrator.validate_context_compaction(
+            {"action_ref": "0"}, conversation
+        )
+        self.assertIn("rewriting BATTLE_LOG.md", error)
+
+        accepted = orchestrator.validate_context_compaction(
+            {
+                "action_ref": "0",
+                "memory_updates": [
+                    {
+                        "path": "BATTLE_LOG.md",
+                        "mode": "write",
+                        "content": "# Battle Log\n\nCompact state.\n",
+                    }
+                ],
+            },
+            conversation,
+        )
+        self.assertIsNone(accepted)
+
+    def test_agent_context_prompt_order_is_role_history_memory_snapshot(self):
+        manager = orchestrator.AgentContextManager(orchestrator.AgentContextConfig(enabled=True))
+        conversation = manager.conversation_for("map_pather")
+        conversation.append_exchange(
+            "old prompt",
+            orchestrator.ModelCompletion(
+                decision={"action_ref": "0"},
+                raw_response={},
+                response_text='{"action_ref":"0"}',
+                request_payload={},
+            ),
+            {"status": "ok"},
+        )
+
+        prompt, _, _, _ = manager.build_prompt(
+            "System instructions.\n\nMemory:\n\n{\"STRATEGY.md\":\"x\"}\n\nSnapshot:\n\n{\"actions\":[]}",
+            "map_pather",
+        )
+
+        role_index = prompt.index("You are the outer map pather")
+        history_index = prompt.index("Agent history:")
+        current_prompt_index = prompt.index("Current decision prompt:")
+        memory_index = prompt.index("Memory:")
+        snapshot_index = prompt.index("Snapshot:")
+        self.assertLess(role_index, memory_index)
+        self.assertLess(role_index, history_index)
+        self.assertLess(history_index, current_prompt_index)
+        self.assertLess(current_prompt_index, memory_index)
+        self.assertLess(memory_index, snapshot_index)
+
+    def test_build_prompt_preserves_memory_order_for_prompt_cache_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Instructions.\n\nMemory:\n\n{{MEMORY_JSON}}\n\nSnapshot:\n\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {"actions": []},
+                {
+                    "STRATEGY.md": "durable",
+                    "CURRENT_RUN.md": "run",
+                    "BATTLE_LOG.md": "volatile",
+                },
+            )
+
+        self.assertLess(prompt.index('"STRATEGY.md"'), prompt.index('"CURRENT_RUN.md"'))
+        self.assertLess(prompt.index('"CURRENT_RUN.md"'), prompt.index('"BATTLE_LOG.md"'))
+        self.assertLess(prompt.index('"BATTLE_LOG.md"'), prompt.index("Snapshot:"))
+
+    def test_map_pather_memory_bundle_excludes_battle_log(self):
+        filtered = orchestrator.memory_bundle_for_context_role(
+            {
+                "STRATEGY.md": "strategy",
+                "CURRENT_RUN.md": "run",
+                "BATTLE_LOG.md": "battle",
+                "HARNESS_BUGS.md": "bug",
+            },
+            "map_pather",
+        )
+
+        self.assertEqual(
+            filtered,
+            {
+                "STRATEGY.md": "strategy",
+                "CURRENT_RUN.md": "run",
+            },
+        )
+
+    def test_agent_context_reset_all_clears_both_sub_agent_histories(self):
+        manager = orchestrator.AgentContextManager(orchestrator.AgentContextConfig(enabled=True))
+        completion = orchestrator.ModelCompletion(
+            decision={"action_ref": "0"},
+            raw_response={},
+            response_text='{"action_ref":"0"}',
+            request_payload={},
+        )
+        manager.conversation_for("map_pather").append_exchange(
+            "map prompt", completion, {"status": "ok"}
+        )
+        manager.conversation_for("battle_tactician").append_exchange(
+            "battle prompt", completion, {"status": "ok"}
+        )
+
+        manager.reset_all()
+
+        self.assertEqual(manager.conversation_for("map_pather").exchanges, [])
+        self.assertEqual(manager.conversation_for("battle_tactician").exchanges, [])
+
+    def test_restore_agent_context_from_trace_rebuilds_non_recursive_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "runs.sqlite"
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute(
+                    """
+                    create table steps (
+                        id integer primary key,
+                        run_id text,
+                        prompt_text text,
+                        response_text text,
+                        action_chosen text,
+                        invalid_action_error text,
+                        observation_json text,
+                        state_type text,
+                        floor integer,
+                        hp integer,
+                        max_hp integer,
+                        gold integer
+                    )
+                    """
+                )
+                prompt = (
+                    "Agent role: battle_tactician\n"
+                    "Prompt-cache hint: old.\n\n"
+                    "You are the battle tactician sub-agent for the current battle.\n\n"
+                    "Memory:\n\n{\"BATTLE_LOG.md\":\"now\"}"
+                    "\n\nAgent history:\nExchange 1\nPrompt:\nold"
+                    "\n\nSnapshot:\n\n{\"actions\":[{\"id\":\"end_turn\"}]}"
+                )
+                conn.execute(
+                    """
+                    insert into steps (
+                        run_id, prompt_text, response_text, action_chosen,
+                        invalid_action_error
+                    ) values (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "old-run",
+                        "Agent role: map_pather\nPrompt-cache hint: old.\n\n"
+                        "You are the outer map pather and strategic agent.\n\n"
+                        "Memory:\n\n{\"STRATEGY.md\":\"old\"}",
+                        '{"action_ref":"old","rationale":"old"}',
+                        '{"id":"old"}',
+                        None,
+                    ),
+                )
+                conn.execute(
+                    """
+                    insert into steps (
+                        run_id, prompt_text, response_text, action_chosen,
+                        invalid_action_error
+                    ) values (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "current-run",
+                        prompt,
+                        '{"action_ref":"end_turn","rationale":"done"}',
+                        '{"id":"end_turn"}',
+                        None,
+                    ),
+                )
+
+            pi_config = root / "pi.json"
+            harness_config = root / "harness.json"
+            harness_config.write_text(
+                json.dumps({"logging": {"sqlite_path": str(sqlite_path)}}),
+                encoding="utf-8",
+            )
+            pi_config.write_text(
+                json.dumps({"harness_config": str(harness_config)}),
+                encoding="utf-8",
+            )
+            config = orchestrator.OrchestratorConfig(
+                rpc_server_command=["python", "pi_agent/rpc_server.py", "--config", str(pi_config)],
+                model=orchestrator.ModelConfig(provider="openai_responses", model="x"),
+                decision_log=str(root / "decisions.jsonl"),
+            )
+            manager = orchestrator.AgentContextManager(
+                orchestrator.AgentContextConfig(enabled=True)
+            )
+
+            record = orchestrator.restore_agent_context_from_trace(manager, config)
+
+        self.assertTrue(record["restored"])
+        self.assertEqual(record["run_id"], "current-run")
+        self.assertEqual(record["exchanges"], 1)
+        exchanges = manager.conversation_for("battle_tactician").exchanges
+        self.assertEqual(len(exchanges), 1)
+        self.assertIn("Restored historical decision from trace", exchanges[0]["prompt"])
+        self.assertNotIn("Memory:", exchanges[0]["prompt"])
+        self.assertNotIn("Snapshot:", exchanges[0]["prompt"])
+        self.assertNotIn("Agent history:", exchanges[0]["prompt"])
 
     def test_current_run_rewrite_out_of_combat_clears_battle_log(self):
         class FakeRpc:
@@ -1085,7 +1511,7 @@ class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
         self.assertEqual(rpc.calls, [])
         self.assertEqual(records, [])
 
-    def test_strategy_rewrite_after_death_resets_run_notes(self):
+    def test_strategy_rewrite_after_completed_run_resets_run_notes(self):
         class FakeRpc:
             def __init__(self):
                 self.calls = []
@@ -1132,13 +1558,60 @@ class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
             [
                 {
                     "path": "CURRENT_RUN.md",
-                    "reason": "strategy_rewritten_after_death",
+                    "reason": "strategy_rewritten_after_completed_run",
                 },
                 {
                     "path": "BATTLE_LOG.md",
-                    "reason": "strategy_rewritten_after_death",
+                    "reason": "strategy_rewritten_after_completed_run",
                 },
             ],
+        )
+
+    def test_strategy_rewrite_after_victory_resets_run_notes(self):
+        class FakeRpc:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None):
+                self.calls.append((method, params))
+
+        rpc = FakeRpc()
+
+        records = orchestrator.enforce_memory_lifecycle(
+            rpc,
+            {
+                "state": {"state_type": "game_over"},
+                "progress_update": {"last_completed_victory": True},
+            },
+            {"STRATEGY.md", "CURRENT_RUN.md"},
+        )
+
+        self.assertEqual(
+            rpc.calls,
+            [
+                (
+                    "write_memory",
+                    {
+                        "path": "CURRENT_RUN.md",
+                        "content": orchestrator.MEMORY_FILE_TEMPLATES[
+                            "CURRENT_RUN.md"
+                        ],
+                    },
+                ),
+                (
+                    "write_memory",
+                    {
+                        "path": "BATTLE_LOG.md",
+                        "content": orchestrator.MEMORY_FILE_TEMPLATES[
+                            "BATTLE_LOG.md"
+                        ],
+                    },
+                ),
+            ],
+        )
+        self.assertEqual(
+            [record["path"] for record in records],
+            ["CURRENT_RUN.md", "BATTLE_LOG.md"],
         )
 
     def test_next_decision_step_resumes_existing_jsonl_counter(self):

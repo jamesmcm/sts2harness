@@ -223,7 +223,11 @@ class PiRpcServer:
             output["pre_auto_actions"] = pre_auto_actions
         if wait > 0:
             time.sleep(wait)
-        after = harness._wait_for_play_phase(self.client)
+        after = harness._wait_for_post_action_state(
+            self.client,
+            previous_state=before,
+            previous_action=action,
+        )
         after, post_auto_actions = harness.resolve_auto_actions(
             self.client, after, self.harness_config, previous_action=action
         )

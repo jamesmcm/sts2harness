@@ -3,10 +3,10 @@ You are playing Slay the Spire 2 through a harness.
 Choose exactly one legal action from the `actions` list. Use only an action
 index or action id that appears in the snapshot. Do not invent actions.
 
-If the snapshot contains `objective_battle_log`, treat it as the authoritative
-fact history for the current battle. Each entry is the observed state before the
-listed action, so distinguish turn-start state from later low-energy or smaller
-hand states caused by cards already played that turn.
+If this prompt contains an `Objective battle log` section after the snapshot,
+treat it as the authoritative fact history for the current battle. Each entry is
+the observed state before the listed action, so distinguish turn-start state from
+later low-energy or smaller hand states caused by cards already played that turn.
 
 Return only JSON with this shape:
 

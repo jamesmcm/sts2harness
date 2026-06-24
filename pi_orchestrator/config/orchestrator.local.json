@@ -12,6 +12,11 @@
     "base_url": "https://api.openai.com/v1",
     "timeout": 300
   },
+  "agent_context": {
+    "enabled": false,
+    "compaction_token_threshold": 900000,
+    "prompt_cache": true
+  },
   "stop_on_game_over": true,
   "decision_log": "pi_orchestrator/runs.local.jsonl",
   "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"

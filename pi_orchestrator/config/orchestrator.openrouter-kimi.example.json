@@ -11,6 +11,11 @@
     "api_key_env": "OPENROUTER_API_KEY",
     "timeout": 300
   },
+  "agent_context": {
+    "enabled": false,
+    "compaction_token_threshold": 900000,
+    "prompt_cache": true
+  },
   "stop_on_game_over": true,
   "decision_log": "/var/lib/sts2harness/agents/pi-agent/decisions-kimi-k2.6.jsonl",
   "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"

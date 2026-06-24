@@ -11,6 +11,11 @@
     "api_key_env": "OPENCODE_API_KEY",
     "timeout": 300
   },
+  "agent_context": {
+    "enabled": false,
+    "compaction_token_threshold": 900000,
+    "prompt_cache": true
+  },
   "stop_on_game_over": false,
   "decision_log": "pi_orchestrator/runs.opencode-go.local.jsonl",
   "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"

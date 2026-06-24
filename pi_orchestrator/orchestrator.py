@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import re
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -32,6 +33,7 @@ DEFAULT_MODEL_RETRY_BACKOFFS = (30.0, 60.0, 120.0, 240.0, 300.0)
 TRANSIENT_MODEL_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 MODEL_DECISION_PARSE_RETRIES = 2
 MODEL_DECISION_PARSE_RETRY_DELAY = 2.0
+DEFAULT_CONTEXT_COMPACTION_TOKENS = 900_000
 MEMORY_FILE_TEMPLATES = {
     "CURRENT_RUN.md": (
         "# Current Run\n\n"
@@ -63,6 +65,13 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class AgentContextConfig:
+    enabled: bool = False
+    compaction_token_threshold: int = DEFAULT_CONTEXT_COMPACTION_TOKENS
+    prompt_cache: bool = True
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     rpc_server_command: list[str]
     model: ModelConfig
@@ -74,6 +83,7 @@ class OrchestratorConfig:
     prompt_template: str = str(
         HARNESS_ROOT / "pi_orchestrator" / "prompts" / "decision_prompt.md"
     )
+    agent_context: AgentContextConfig = AgentContextConfig()
 
 
 def _load_json(path: str | Path) -> JsonDict:
@@ -114,6 +124,26 @@ def load_config(path: str | Path) -> OrchestratorConfig:
             raw.get("prompt_template")
             or HARNESS_ROOT / "pi_orchestrator" / "prompts" / "decision_prompt.md"
         ),
+        agent_context=_agent_context_config(raw.get("agent_context")),
+    )
+
+
+def _agent_context_config(value: Any) -> AgentContextConfig:
+    if value is None:
+        return AgentContextConfig()
+    if isinstance(value, bool):
+        return AgentContextConfig(enabled=value)
+    if not isinstance(value, dict):
+        raise ValueError("config.agent_context must be a boolean or object")
+    threshold = int(
+        value.get("compaction_token_threshold", DEFAULT_CONTEXT_COMPACTION_TOKENS)
+    )
+    if threshold <= 0:
+        raise ValueError("config.agent_context.compaction_token_threshold must be > 0")
+    return AgentContextConfig(
+        enabled=bool(value.get("enabled", False)),
+        compaction_token_threshold=threshold,
+        prompt_cache=bool(value.get("prompt_cache", True)),
     )
 
 
@@ -227,6 +257,7 @@ class ModelCompletion:
     generation_stats: JsonDict | None = None
     generation_content: JsonDict | None = None
     input_tokens: int | None = None
+    cached_input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
 
@@ -629,6 +660,11 @@ def _completion_from_response(
         input_tokens=_usage_int(
             usage, "input_tokens", "prompt_tokens", "total_input_tokens"
         ),
+        cached_input_tokens=(
+            _usage_nested_int(usage, "input_tokens_details", "cached_tokens")
+            or _usage_nested_int(usage, "prompt_tokens_details", "cached_tokens")
+            or _usage_int(usage, "cached_input_tokens", "cached_prompt_tokens")
+        ),
         output_tokens=_usage_int(
             usage, "output_tokens", "completion_tokens", "total_output_tokens"
         ),
@@ -644,12 +680,8 @@ def _enrich_openrouter_completion(
 ) -> ModelCompletion:
     data = _generation_data(generation_stats)
     content_data = _generation_data(generation_content)
-    prompt_text = None
     response_text = completion.response_text
     if content_data:
-        input_data = content_data.get("input")
-        if isinstance(input_data, dict):
-            prompt_text = _optional_str(input_data.get("prompt"))
         output_data = content_data.get("output")
         if isinstance(output_data, dict):
             response_text = _optional_str(output_data.get("completion")) or response_text
@@ -680,6 +712,7 @@ def _enrich_openrouter_completion(
         generation_stats=generation_stats,
         generation_content=generation_content,
         input_tokens=completion.input_tokens,
+        cached_input_tokens=completion.cached_input_tokens,
         output_tokens=completion.output_tokens,
         total_tokens=completion.total_tokens,
     )
@@ -737,6 +770,17 @@ def _usage_int(usage: JsonDict, *keys: str) -> int | None:
     return None
 
 
+def _usage_nested_int(usage: JsonDict, *path: str) -> int | None:
+    value: Any = usage
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _tokens_per_second(tokens: int | None, elapsed_seconds: float | None) -> float | None:
     if tokens is None or elapsed_seconds is None or elapsed_seconds <= 0:
         return None
@@ -762,13 +806,541 @@ def _sha256_json(value: Any) -> str:
 
 def build_prompt(template_path: str, snapshot: JsonDict, memory: JsonDict) -> str:
     template = Path(template_path).read_text(encoding="utf-8")
+    prompt_snapshot, objective_battle_log = _snapshot_without_objective_battle_log(
+        snapshot
+    )
     prompt = template.replace(
-        "{{SNAPSHOT_JSON}}", json.dumps(snapshot, indent=2, sort_keys=True)
-    ).replace("{{MEMORY_JSON}}", json.dumps(memory, indent=2, sort_keys=True))
+        "{{SNAPSHOT_JSON}}", json.dumps(prompt_snapshot, indent=2, sort_keys=True)
+    ).replace("{{MEMORY_JSON}}", json.dumps(memory, indent=2))
     lifecycle_requirement = build_lifecycle_requirement(snapshot, memory)
     if lifecycle_requirement:
-        prompt += f"\n\nLifecycle requirement:\n{lifecycle_requirement}\n"
+        prompt = _insert_before_snapshot(
+            prompt, f"\n\nLifecycle requirement:\n{lifecycle_requirement}\n"
+        )
+    if objective_battle_log is not None:
+        prompt += (
+            "\n\nObjective battle log:\n"
+            f"{json.dumps(objective_battle_log, indent=2, sort_keys=True)}\n"
+        )
     return prompt
+
+
+def _insert_before_snapshot(prompt: str, text: str) -> str:
+    snapshot_start = _snapshot_section_start(prompt)
+    if snapshot_start is None:
+        return prompt + text
+    return prompt[:snapshot_start] + text + prompt[snapshot_start:]
+
+
+def _snapshot_section_start(prompt: str) -> int | None:
+    for marker in ("\nSnapshot:\n\n", "\nSnapshot:\n"):
+        snapshot_start = prompt.rfind(marker)
+        if snapshot_start != -1:
+            return snapshot_start
+    return None
+
+
+def _snapshot_without_objective_battle_log(
+    snapshot: JsonDict,
+) -> tuple[JsonDict, Any | None]:
+    if "objective_battle_log" not in snapshot:
+        return snapshot, None
+    prompt_snapshot = dict(snapshot)
+    return prompt_snapshot, prompt_snapshot.pop("objective_battle_log")
+
+
+def _estimated_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _state_has_active_battle(state: JsonDict) -> bool:
+    if state.get("state_type") == "monster":
+        return True
+    battle = state.get("battle")
+    return isinstance(battle, dict) and state.get("state_type") == "hand_select"
+
+
+def context_role_for_snapshot(snapshot: JsonDict, memory: JsonDict) -> str:
+    state = snapshot.get("state") if isinstance(snapshot.get("state"), dict) else {}
+    if _state_has_active_battle(state):
+        return "battle_tactician"
+    if _snapshot_has_finished_battle(snapshot) and _memory_file_has_active_notes(
+        memory.get("BATTLE_LOG.md"), "BATTLE_LOG.md"
+    ):
+        return "battle_tactician"
+    return "map_pather"
+
+
+def context_compaction_target(role: str) -> str:
+    if role == "battle_tactician":
+        return "BATTLE_LOG.md"
+    return "CURRENT_RUN.md"
+
+
+def build_context_compaction_requirement(role: str, target_path: str) -> str:
+    if role == "battle_tactician":
+        return (
+            "- The battle tactician context is near its token limit. Before taking "
+            "the next combat action, rewrite `BATTLE_LOG.md` as a compact but "
+            "complete tactical state for this battle: enemy intents, HP/block "
+            "math, cards played this turn, hand/draw/discard facts that matter, "
+            "potion/lethal plans, and lessons needed to continue the fight. The "
+            "harness will then drop older battle context and keep only the most "
+            "recent decision plus the memory files injected in future prompts."
+        )
+    return (
+        f"- The strategic map/pathing context is near its token limit. Before "
+        f"taking the next non-combat action, rewrite `{target_path}` as a compact "
+        "but complete active run state: seed/ascension/floor, HP/gold, deck and "
+        "upgrades, relics, potions, route/boss/reward plan, risks, and recent "
+        "decisions needed to continue the run. The harness will then drop older "
+        "strategic context and keep only the most recent decision plus the memory "
+        "files injected in future prompts."
+    )
+
+
+@dataclass
+class AgentConversation:
+    role: str
+    exchanges: list[JsonDict]
+    pending_compaction_path: str | None = None
+    pending_compaction_prompted: bool = False
+
+    def transcript(self) -> str:
+        if not self.exchanges:
+            return ""
+        parts = [
+            "Prior context for this same agent role. Treat this as your own "
+            "conversation history, but the current Snapshot and Memory below are "
+            "authoritative when they conflict.\n"
+        ]
+        for index, exchange in enumerate(self.exchanges, 1):
+            parts.append(f"\n## Prior decision {index}\n")
+            parts.append("Prompt:\n")
+            parts.append(str(exchange.get("prompt") or ""))
+            parts.append("\nDecision JSON:\n")
+            parts.append(str(exchange.get("response_text") or ""))
+            result = exchange.get("result_summary")
+            if result is not None:
+                parts.append("\nResult summary:\n")
+                parts.append(json.dumps(result, indent=2, sort_keys=True))
+            parts.append("\n")
+        return "".join(parts)
+
+    def estimated_tokens_with(self, prompt: str) -> int:
+        return _estimated_tokens(self.transcript() + prompt)
+
+    def append_exchange(
+        self, prompt: str, completion: ModelCompletion, result_summary: JsonDict
+    ) -> None:
+        self.exchanges.append(
+            {
+                "prompt": prompt,
+                "response_text": completion.response_text,
+                "decision": completion.decision,
+                "result_summary": result_summary,
+            }
+        )
+
+    def compact_to_recent_exchange(self) -> None:
+        if self.exchanges:
+            self.exchanges = [self.exchanges[-1]]
+        self.pending_compaction_path = None
+        self.pending_compaction_prompted = False
+
+    def reset(self) -> None:
+        self.exchanges = []
+        self.pending_compaction_path = None
+        self.pending_compaction_prompted = False
+
+
+class AgentContextManager:
+    def __init__(self, config: AgentContextConfig) -> None:
+        self.config = config
+        self.conversations: dict[str, AgentConversation] = {
+            "map_pather": AgentConversation("map_pather", []),
+            "battle_tactician": AgentConversation("battle_tactician", []),
+        }
+
+    def conversation_for(self, role: str) -> AgentConversation:
+        return self.conversations[role]
+
+    def reset_all(self) -> None:
+        for conversation in self.conversations.values():
+            conversation.reset()
+
+    def build_prompt(
+        self, base_prompt: str, role: str
+    ) -> tuple[str, str, AgentConversation, JsonDict]:
+        conversation = self.conversation_for(role)
+        current_prompt = self._with_role_header(base_prompt, role)
+        compaction_path = conversation.pending_compaction_path
+        compaction_triggered = False
+        estimated_tokens = conversation.estimated_tokens_with(current_prompt)
+        if (
+            compaction_path is None
+            and estimated_tokens >= self.config.compaction_token_threshold
+        ):
+            compaction_path = context_compaction_target(role)
+            conversation.pending_compaction_path = compaction_path
+            conversation.pending_compaction_prompted = True
+            compaction_triggered = True
+        if compaction_path is not None:
+            current_prompt = _insert_before_snapshot(
+                current_prompt,
+                "\n\nContext compaction requirement:\n"
+                f"{build_context_compaction_requirement(role, compaction_path)}\n",
+            )
+        transcript = conversation.transcript()
+        prompt = self._with_role_header(
+            _prompt_with_history_before_current_prompt(base_prompt, transcript), role
+        )
+        if compaction_path is not None:
+            prompt = _insert_before_snapshot(
+                prompt,
+                "\n\nContext compaction requirement:\n"
+                f"{build_context_compaction_requirement(role, compaction_path)}\n",
+            )
+        cache_prefix = self._prompt_cache_prefix(role)
+        prompt = cache_prefix + prompt
+        return (
+            prompt,
+            cache_prefix + current_prompt,
+            conversation,
+            {
+                "role": role,
+                "enabled": True,
+                "prompt_cache": self.config.prompt_cache,
+                "estimated_tokens": _estimated_tokens(prompt),
+                "history_exchanges": len(conversation.exchanges),
+                "compaction_path": compaction_path,
+                "compaction_triggered": compaction_triggered,
+            },
+        )
+
+    def _prompt_cache_prefix(self, role: str) -> str:
+        if not self.config.prompt_cache:
+            return ""
+        return (
+            f"Agent role: {role}\n"
+            "Prompt-cache hint: this prompt keeps stable role instructions and "
+            "prior same-role context before volatile current memory and snapshot "
+            "data so providers with automatic prompt caching can reuse the "
+            "unchanged prefix.\n\n"
+        )
+
+    def _with_role_header(self, prompt: str, role: str) -> str:
+        if role == "battle_tactician":
+            header = (
+                "You are the battle tactician sub-agent for the current battle. "
+                "Keep tactical continuity across combat decisions. During combat, "
+                "prefer `BATTLE_LOG.md` for compact tactical state; when the battle "
+                "is finished, fold useful battle results into `CURRENT_RUN.md` as "
+                "required by lifecycle instructions.\n\n"
+            )
+        else:
+            header = (
+                "You are the outer map pather and strategic agent. Keep route, "
+                "reward, event, shop, rest-site, and run-level strategy continuity. "
+                "When entering combat, your context is preserved while the battle "
+                "tactician sub-agent handles combat.\n\n"
+            )
+        return header + prompt
+
+
+def _prompt_with_history_before_current_prompt(
+    base_prompt: str, history: str
+) -> str:
+    if not history:
+        return base_prompt
+    return f"Agent history:\n{history}\n\nCurrent decision prompt:\n{base_prompt}"
+
+
+def restore_agent_context_from_trace(
+    manager: AgentContextManager, config: OrchestratorConfig
+) -> JsonDict:
+    sqlite_path = _trace_sqlite_path(config)
+    if sqlite_path is None or not sqlite_path.exists():
+        return {"restored": False, "reason": "trace sqlite not found"}
+    restored = 0
+    skipped = 0
+    try:
+        with sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True) as conn:
+            latest_run = conn.execute(
+                """
+                select run_id
+                  from steps
+                 where prompt_text is not null
+                   and response_text is not null
+                 order by id desc
+                 limit 1
+                """
+            ).fetchone()
+            if latest_run is None:
+                return {
+                    "restored": True,
+                    "sqlite_path": str(sqlite_path),
+                    "run_id": None,
+                    "exchanges": 0,
+                    "skipped": 0,
+                    "roles": {
+                        role: len(conversation.exchanges)
+                        for role, conversation in manager.conversations.items()
+                    },
+                }
+            run_id = latest_run[0]
+            rows = conn.execute(
+                """
+                select prompt_text, response_text, action_chosen, invalid_action_error,
+                       observation_json, state_type, floor, hp, max_hp, gold
+                  from steps
+                 where run_id = ?
+                   and prompt_text is not null
+                   and response_text is not null
+                 order by id
+                """,
+                (run_id,),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        return {"restored": False, "reason": f"trace sqlite read failed: {exc}"}
+    for (
+        prompt_text,
+        response_text,
+        action_chosen,
+        invalid_error,
+        observation_json,
+        state_type,
+        floor,
+        hp,
+        max_hp,
+        gold,
+    ) in rows:
+        if not isinstance(prompt_text, str) or not isinstance(response_text, str):
+            skipped += 1
+            continue
+        role = _role_from_prompt_text(prompt_text)
+        if role is None:
+            skipped += 1
+            continue
+        exchange_prompt = _restored_exchange_prompt_summary(
+            observation_json, state_type, floor, hp, max_hp, gold
+        )
+        decision = _decision_from_response_text(response_text)
+        result_summary = _result_summary_from_trace(action_chosen, invalid_error)
+        manager.conversation_for(role).append_exchange(
+            exchange_prompt,
+            ModelCompletion(
+                decision=decision,
+                raw_response={},
+                response_text=response_text,
+                request_payload={},
+            ),
+            result_summary,
+        )
+        restored += 1
+    return {
+        "restored": True,
+        "sqlite_path": str(sqlite_path),
+        "run_id": run_id,
+        "exchanges": restored,
+        "skipped": skipped,
+        "roles": {
+            role: len(conversation.exchanges)
+            for role, conversation in manager.conversations.items()
+        },
+    }
+
+
+def _restored_exchange_prompt_summary(
+    observation_json: Any,
+    state_type: Any,
+    floor: Any,
+    hp: Any,
+    max_hp: Any,
+    gold: Any,
+) -> str:
+    parts = [
+        "Restored historical decision from trace. The original full prompt is "
+        "omitted on resume to keep context bounded; the current Snapshot and "
+        "Memory in the live prompt are authoritative.\n"
+    ]
+    state_text = _optional_trace_value(state_type)
+    if state_text is not None:
+        parts.append(f"- state_type: {state_text}\n")
+    floor_text = _optional_trace_value(floor)
+    if floor_text is not None:
+        parts.append(f"- floor: {floor_text}\n")
+    if hp is not None or max_hp is not None:
+        parts.append(f"- hp: {_optional_trace_value(hp) or '?'}")
+        max_hp_text = _optional_trace_value(max_hp)
+        if max_hp_text is not None:
+            parts.append(f"/{max_hp_text}")
+        parts.append("\n")
+    gold_text = _optional_trace_value(gold)
+    if gold_text is not None:
+        parts.append(f"- gold: {gold_text}\n")
+    actions = _actions_summary_from_observation_json(observation_json)
+    if actions:
+        parts.append("- legal_actions: ")
+        parts.append("; ".join(actions))
+        parts.append("\n")
+    return "".join(parts)
+
+
+def _optional_trace_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _actions_summary_from_observation_json(observation_json: Any) -> list[str]:
+    if not isinstance(observation_json, str) or not observation_json:
+        return []
+    try:
+        observation = json.loads(observation_json)
+    except json.JSONDecodeError:
+        return []
+    actions = observation.get("actions") if isinstance(observation, dict) else None
+    if not isinstance(actions, list):
+        return []
+    result: list[str] = []
+    for action in actions[:20]:
+        if not isinstance(action, dict):
+            continue
+        action_id = _optional_trace_value(action.get("id"))
+        label = _optional_trace_value(action.get("label"))
+        if action_id and label:
+            result.append(f"{action_id} ({label})")
+        elif action_id:
+            result.append(action_id)
+        elif label:
+            result.append(label)
+    if len(actions) > len(result):
+        result.append(f"... {len(actions) - len(result)} more")
+    return result
+
+
+def _trace_sqlite_path(config: OrchestratorConfig) -> Path | None:
+    path = _trace_sqlite_path_from_rpc_command(config.rpc_server_command)
+    if path is not None:
+        return path
+    decision_log = Path(config.decision_log).expanduser()
+    if decision_log.name:
+        return decision_log.parent / "runs.sqlite"
+    return None
+
+
+def _trace_sqlite_path_from_rpc_command(command: list[str]) -> Path | None:
+    try:
+        config_index = command.index("--config") + 1
+    except ValueError:
+        return None
+    if config_index >= len(command):
+        return None
+    try:
+        pi_config = _load_json(command[config_index])
+        harness_config_path = pi_config.get("harness_config")
+        if not isinstance(harness_config_path, str):
+            return None
+        harness_config = _load_json(harness_config_path)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    logging_config = harness_config.get("logging")
+    if not isinstance(logging_config, dict):
+        return None
+    sqlite_path = logging_config.get("sqlite_path")
+    if not isinstance(sqlite_path, str) or not sqlite_path:
+        return None
+    return Path(sqlite_path).expanduser()
+
+
+def _role_from_prompt_text(prompt_text: str) -> str | None:
+    first_line = prompt_text.splitlines()[0] if prompt_text.splitlines() else ""
+    match = re.match(r"Agent role: ([A-Za-z0-9_]+)", first_line)
+    if match:
+        role = match.group(1)
+        if role in {"map_pather", "battle_tactician"}:
+            return role
+    if "You are the battle tactician sub-agent" in prompt_text:
+        return "battle_tactician"
+    if "You are the outer map pather" in prompt_text:
+        return "map_pather"
+    return None
+
+
+def _current_exchange_prompt_from_trace(prompt_text: str) -> str:
+    marker = "\n\nCurrent decision prompt:\n"
+    if marker in prompt_text:
+        return prompt_text.rsplit(marker, 1)[1]
+    history_marker = "\n\nAgent history:\n"
+    snapshot_marker = "\n\nSnapshot:\n"
+    history_start = prompt_text.find(history_marker)
+    if history_start == -1:
+        return _strip_cache_and_role_header(prompt_text)
+    snapshot_start = prompt_text.find(snapshot_marker, history_start + len(history_marker))
+    if snapshot_start == -1:
+        return _strip_cache_and_role_header(prompt_text[:history_start])
+    return _strip_cache_and_role_header(
+        prompt_text[:history_start] + prompt_text[snapshot_start:]
+    )
+
+
+def _strip_cache_and_role_header(prompt_text: str) -> str:
+    text = prompt_text
+    if text.startswith("Agent role: "):
+        parts = text.split("\n\n", 2)
+        if len(parts) == 3:
+            text = parts[2]
+    for header in (
+        "You are the battle tactician sub-agent",
+        "You are the outer map pather",
+    ):
+        index = text.find(header)
+        if index == -1:
+            continue
+        end = text.find("\n\n", index)
+        if end != -1:
+            return text[end + 2 :]
+    return text
+
+
+def _decision_from_response_text(response_text: str) -> JsonDict:
+    try:
+        return _parse_json_text(response_text)
+    except (json.JSONDecodeError, ValueError):
+        return {"action_ref": "", "rationale": "historical response was invalid JSON"}
+
+
+def _result_summary_from_trace(action_chosen: Any, invalid_error: Any) -> JsonDict:
+    if isinstance(invalid_error, str) and invalid_error:
+        return {"status": "rejected", "error": invalid_error}
+    action = None
+    if isinstance(action_chosen, str) and action_chosen:
+        try:
+            action = json.loads(action_chosen)
+        except json.JSONDecodeError:
+            action = action_chosen
+    return {"status": "ok", "action": action}
+
+
+def memory_bundle_for_context_role(memory: JsonDict, role: str) -> JsonDict:
+    if role == "map_pather":
+        allowed = ("STRATEGY.md", "CURRENT_RUN.md")
+    elif role == "battle_tactician":
+        allowed = ("STRATEGY.md", "CURRENT_RUN.md", "BATTLE_LOG.md")
+    else:
+        allowed = tuple(memory.keys())
+    return {path: memory[path] for path in allowed if path in memory}
+
+
+def validate_context_compaction(decision: JsonDict, conversation: AgentConversation) -> str | None:
+    path = conversation.pending_compaction_path
+    if path is None:
+        return None
+    if path in memory_update_write_paths(decision):
+        return None
+    return f"context compaction requires rewriting {path} before advancing"
 
 
 def read_memory_bundle(rpc: JsonRpcClient) -> JsonDict:
@@ -869,10 +1441,10 @@ def validate_memory_quality(
 def required_lifecycle_memory_write(
     snapshot: JsonDict, memory: JsonDict
 ) -> tuple[str, str] | None:
-    if _snapshot_has_failed_completed_run(snapshot):
+    if _snapshot_has_completed_run(snapshot):
         return (
             "STRATEGY.md",
-            "completed failed run requires a durable strategy revision",
+            "completed run requires a durable strategy revision",
         )
     if _snapshot_has_finished_battle(snapshot) and _memory_file_has_active_notes(
         memory.get("BATTLE_LOG.md"), "BATTLE_LOG.md"
@@ -893,9 +1465,10 @@ def build_lifecycle_requirement(snapshot: JsonDict, memory: JsonDict) -> str:
         return (
             f"- {reason}. Before choosing the restart/advance action, rewrite "
             "`STRATEGY.md` with comprehensive lessons from the completed run: "
-            "why it died, what card/relic/pathing/tactical choices mattered, and "
-            "what to do differently in future runs. `STRATEGY.md` is your only "
-            "persistent cross-run playbook, so do not make a sparse summary; "
+            "whether it won or died, what card/relic/pathing/tactical choices "
+            "mattered, and what to repeat or do differently in future runs. "
+            "`STRATEGY.md` is your only persistent cross-run playbook, so do not "
+            "make a sparse summary; "
             "read the full `STRATEGY.md`, `CURRENT_RUN.md`, and `BATTLE_LOG.md` "
             "contents already provided in this same prompt's `Memory` section and "
             "preserve all useful learning needed to play better next time. This "
@@ -937,21 +1510,20 @@ def enforce_memory_lifecycle(
         )
         cleared_battle_log = True
 
-    if _snapshot_has_failed_completed_run(snapshot) and "STRATEGY.md" in written_paths:
-        if "CURRENT_RUN.md" not in written_paths:
-            rpc.call(
-                "write_memory",
-                {
-                    "path": "CURRENT_RUN.md",
-                    "content": MEMORY_FILE_TEMPLATES["CURRENT_RUN.md"],
-                },
-            )
-            records.append(
-                {
-                    "path": "CURRENT_RUN.md",
-                    "reason": "strategy_rewritten_after_death",
-                }
-            )
+    if _snapshot_has_completed_run(snapshot) and "STRATEGY.md" in written_paths:
+        rpc.call(
+            "write_memory",
+            {
+                "path": "CURRENT_RUN.md",
+                "content": MEMORY_FILE_TEMPLATES["CURRENT_RUN.md"],
+            },
+        )
+        records.append(
+            {
+                "path": "CURRENT_RUN.md",
+                "reason": "strategy_rewritten_after_completed_run",
+            }
+        )
         if not cleared_battle_log:
             rpc.call(
                 "write_memory",
@@ -963,7 +1535,7 @@ def enforce_memory_lifecycle(
             records.append(
                 {
                     "path": "BATTLE_LOG.md",
-                    "reason": "strategy_rewritten_after_death",
+                    "reason": "strategy_rewritten_after_completed_run",
                 }
             )
 
@@ -1003,6 +1575,20 @@ def _snapshot_has_failed_completed_run(value: Any) -> bool:
         return any(_snapshot_has_failed_completed_run(child) for child in value.values())
     if isinstance(value, list):
         return any(_snapshot_has_failed_completed_run(child) for child in value)
+    return False
+
+
+def _snapshot_has_completed_run(value: Any) -> bool:
+    if isinstance(value, dict):
+        progress = value.get("progress_update")
+        if (
+            isinstance(progress, dict)
+            and isinstance(progress.get("last_completed_victory"), bool)
+        ):
+            return True
+        return any(_snapshot_has_completed_run(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_snapshot_has_completed_run(child) for child in value)
     return False
 
 
@@ -1181,10 +1767,26 @@ def complete_with_response_retries(
 
 def run(config: OrchestratorConfig) -> int:
     provider = make_provider(config.model)
+    context_manager = (
+        AgentContextManager(config.agent_context)
+        if config.agent_context.enabled
+        else None
+    )
     rpc = JsonRpcClient(config.rpc_server_command)
     try:
         rpc.call("ping", {})
         step = next_decision_step(config.decision_log)
+        if context_manager is not None and step > 0:
+            restore_record = restore_agent_context_from_trace(context_manager, config)
+            append_decision_log(
+                config.decision_log,
+                {
+                    "timestamp": time.time(),
+                    "step": step,
+                    "event": "agent_context_restored",
+                    "agent_context_restore": restore_record,
+                },
+            )
         steps_taken = 0
         while config.max_steps is None or steps_taken < config.max_steps:
             snapshot, state, actions = snapshot_with_actions(rpc, config, step)
@@ -1200,7 +1802,25 @@ def run(config: OrchestratorConfig) -> int:
                 )
                 return 0
             memory = read_memory_bundle(rpc)
-            prompt = build_prompt(config.prompt_template, snapshot, memory)
+            context_record: JsonDict = {"enabled": False}
+            conversation: AgentConversation | None = None
+            role = "single_agent"
+            if context_manager is not None:
+                role = context_role_for_snapshot(snapshot, memory)
+                prompt_memory = memory_bundle_for_context_role(memory, role)
+            else:
+                prompt_memory = memory
+            base_prompt = build_prompt(config.prompt_template, snapshot, prompt_memory)
+            exchange_prompt = base_prompt
+            if context_manager is not None:
+                (
+                    prompt,
+                    exchange_prompt,
+                    conversation,
+                    context_record,
+                ) = context_manager.build_prompt(base_prompt, role)
+            else:
+                prompt = base_prompt
             model_started = time.monotonic()
             completion = complete_with_response_retries(provider, config, prompt, step)
             model_elapsed_seconds = time.monotonic() - model_started
@@ -1215,12 +1835,15 @@ def run(config: OrchestratorConfig) -> int:
                 validation_error = validate_memory_lifecycle(
                     decision, snapshot, memory
                 )
+            if validation_error is None and conversation is not None:
+                validation_error = validate_context_compaction(decision, conversation)
             if validation_error is None:
                 validation_error = validate_memory_quality(decision, snapshot, memory)
             memory_update_count = 0
             memory_preread_count = 0
             memory_lifecycle: list[JsonDict] = []
             act_count = 0
+            written_paths: set[str] = set()
             if validation_error is None:
                 try:
                     written_paths = apply_memory_updates(rpc, decision)
@@ -1244,6 +1867,36 @@ def run(config: OrchestratorConfig) -> int:
                     "error": validation_error,
                     "action": action_ref,
                 }
+            result_summary = _result_summary(result)
+            if conversation is not None:
+                conversation.append_exchange(
+                    exchange_prompt, completion, result_summary
+                )
+                if (
+                    validation_error is None
+                    and conversation.pending_compaction_path is not None
+                    and conversation.pending_compaction_path in written_paths
+                ):
+                    conversation.compact_to_recent_exchange()
+                    context_record["compacted"] = True
+                else:
+                    context_record["compacted"] = False
+                if (
+                    role == "battle_tactician"
+                    and validation_error is None
+                    and "CURRENT_RUN.md" in written_paths
+                    and _snapshot_has_finished_battle(snapshot)
+                ):
+                    conversation.reset()
+                    context_record["battle_context_reset"] = True
+                if (
+                    context_manager is not None
+                    and validation_error is None
+                    and "STRATEGY.md" in written_paths
+                    and _snapshot_has_completed_run(snapshot)
+                ):
+                    context_manager.reset_all()
+                    context_record["all_context_reset"] = True
             tool_calls = {
                 "snapshot": 1,
                 "memory_reads": 4 + memory_preread_count,
@@ -1273,10 +1926,12 @@ def run(config: OrchestratorConfig) -> int:
                     "generation_stats": completion.generation_stats,
                     "generation_content": completion.generation_content,
                     "input_tokens": completion.input_tokens,
+                    "cached_input_tokens": completion.cached_input_tokens,
                     "output_tokens": completion.output_tokens,
                     "model_elapsed_seconds": model_elapsed_seconds,
                     "tool_calls": tool_calls,
                     "model_calls": 1,
+                    "agent_context": context_record,
                 },
             )
             total_tokens = _completion_total_tokens(completion)
@@ -1290,6 +1945,7 @@ def run(config: OrchestratorConfig) -> int:
                     "validation_error": validation_error,
                     "usage": {
                         "input_tokens": completion.input_tokens,
+                        "cached_input_tokens": completion.cached_input_tokens,
                         "output_tokens": completion.output_tokens,
                         "total_tokens": total_tokens,
                     },
@@ -1317,8 +1973,9 @@ def run(config: OrchestratorConfig) -> int:
                     "response_hash": _sha256_json(completion.raw_response),
                     "tool_calls": tool_calls,
                     "telemetry": telemetry,
-                    "result_summary": _result_summary(result),
+                    "result_summary": result_summary,
                     "memory_lifecycle": memory_lifecycle,
+                    "agent_context": context_record,
                 },
             )
             step += 1

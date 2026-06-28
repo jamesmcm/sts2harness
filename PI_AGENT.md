@@ -240,7 +240,9 @@ Use `provider: "opencode_go"` to call OpenCode Go directly from the harness
 with an OpenCode Go API key. This does not use the OpenCode CLI or Pi extension.
 The provider defaults to `model: "deepseek-v4-flash"`,
 `api_key_env: "OPENCODE_API_KEY"`, and
-`base_url: "https://opencode.ai/zen/go/v1"`.
+`base_url: "https://opencode.ai/zen/go/v1"`. When agent context is enabled,
+the default compaction threshold is derived from the 1M-token model window and
+is set around 800k tokens unless overridden.
 
 Example:
 
@@ -265,6 +267,59 @@ The model name is the raw OpenCode Go API model ID. For example, the
 `pi-opencode-bridge` Pi package exposes this same model in Pi as
 `oc-sdk-go/deepseek-v4-flash`, where `oc-sdk-go` is the Pi provider prefix and
 `deepseek-v4-flash` is the API model ID used here.
+
+### llama-server
+
+Use `provider: "llama_server"` to call a local llama.cpp `llama-server`
+OpenAI-compatible `/chat/completions` endpoint. The provider defaults to
+`model: "qwen35-9b"`, `base_url: "http://127.0.0.1:8080/v1"`, no API key,
+`cache_prompt: true`, `max_tokens: 20000`, and a 32k context window with
+compaction at about 24k tokens.
+
+Example config:
+
+```text
+pi_orchestrator/config/orchestrator.llama-server.local.json
+```
+
+To start an isolated local sub-agent trial run with the `qwen35-9b`
+llama-server model:
+
+```bash
+scripts/run_llama_server_qwen35_trial.sh
+```
+
+The provider sends `cache_prompt: true` so llama-server can reuse its prompt
+cache. The checked-in local config also sends `id_slot: 0`, which pins this
+single local harness to one llama-server slot. Remove `id_slot` when sharing the
+same server with other clients. If llama-server logs `prompt_save` and `looking
+for better prompt`, automatic prompt caching is already active; a later `forcing
+full prompt re-processing` usually means the common prefix was shorter than the
+available checkpoint, or the model/server cannot restore that checkpoint. In
+that case, prefer improving stable prompt prefix reuse or server checkpoint/SWA
+settings before adding explicit slot save/restore calls.
+
+The orchestrator treats empty chat content as a retryable model response
+failure. It also retries rejected decisions with a correction prompt that
+includes the exact validation error, the previous decision JSON, and the legal
+actions list. The local llama-server config enables `agent_context` by default,
+so map/pathing and battle/tactical context are split across sub-agent roles. The
+provider supports `thinking_mode`:
+
+```json
+{
+  "model": {
+    "provider": "llama_server",
+    "model": "qwen35-9b",
+    "thinking_mode": "auto",
+    "no_thinking_action_threshold": 2
+  }
+}
+```
+
+`thinking_mode: "auto"` disables thinking when there are one or two legal
+actions and enables it when there are more. Use `"enabled"` or `"disabled"` to
+force one behavior for every call.
 
 ### Other OpenAI-Compatible APIs
 

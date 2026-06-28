@@ -1,26 +1,26 @@
 {
   "agent": {
     "agent_name": "pi-agent",
-    "model_name": "deepseek-v4-flash",
-    "condition_name": "opencode-go-memory-trial",
-    "prompt_version": "2026-06-18-opencode-go",
+    "model_name": "qwen35-9b",
+    "condition_name": "llama-server-subagent-memory-trial",
+    "prompt_version": "2026-06-28-llama-server-subagent",
     "memory_version": "strategy-v1"
   },
   "run_setup": {
-    "seed_policy": "fixed_list_until_win",
-    "seed_file": "seed_sets/opencode_go_deepseek_v4_flash_trial_20260618.txt",
+    "seed_policy": "fixed_until_win",
+    "seed": "R58NTKJSSE",
     "ascension": 0,
     "max_ascension": 10,
     "stop_after_consecutive_a10_wins": 3,
     "character": "IRONCLAD",
-    "progress_file": ".sts2harness-opencode-go-progress.json",
+    "progress_file": ".sts2harness-llama-server-progress.json",
     "save_root": "~/.local/share/SlayTheSpire2/steam",
     "increment_ascension_on_win": true
   },
   "logging": {
     "official_run_logging": true,
-    "sqlite_path": ".sts2harness-opencode-go-runs.sqlite",
-    "harness_version": "local-opencode-go-trial"
+    "sqlite_path": ".sts2harness-llama-server-runs.sqlite",
+    "harness_version": "local-llama-server-subagent-trial"
   },
   "auto_resolve": {
     "enabled": true,

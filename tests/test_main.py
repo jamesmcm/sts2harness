@@ -259,6 +259,64 @@ class PiOrchestratorConfigTests(unittest.TestCase):
         self.assertEqual(config.model.model, "deepseek-v4-flash")
         self.assertIsNone(config.max_steps)
 
+    def test_llama_server_provider_defaults_to_local_qwen_and_8k_compaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orchestrator.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+                        "model": {"provider": "llama_server"},
+                        "agent_context": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = orchestrator.load_config(path)
+
+        self.assertEqual(config.model.provider, "llama_server")
+        self.assertEqual(config.model.model, "qwen35-9b")
+        self.assertEqual(config.model.base_url, None)
+        self.assertEqual(config.model.thinking_mode, "auto")
+        self.assertEqual(config.agent_context.context_window_tokens, 32000)
+        self.assertEqual(config.agent_context.compaction_token_threshold, 8000)
+
+    def test_llama_server_checked_in_config_enables_subagent_context(self):
+        config = orchestrator.load_config(
+            "pi_orchestrator/config/orchestrator.llama-server.local.json"
+        )
+
+        self.assertEqual(config.model.provider, "llama_server")
+        self.assertEqual(config.model.model, "qwen35-9b")
+        self.assertEqual(config.model.id_slot, 0)
+        self.assertEqual(config.agent_context.context_window_tokens, 48000)
+        self.assertTrue(config.agent_context.enabled)
+        self.assertEqual(config.agent_context.compaction_token_threshold, 24000)
+        self.assertTrue(config.agent_context.prompt_cache)
+
+    def test_model_context_window_drives_large_window_compaction_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "orchestrator.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
+                        "model": {
+                            "provider": "opencode_go",
+                            "context_window_tokens": 1000000,
+                        },
+                        "agent_context": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = orchestrator.load_config(path)
+
+        self.assertEqual(config.agent_context.context_window_tokens, 1000000)
+        self.assertEqual(config.agent_context.compaction_token_threshold, 800000)
+
     def test_max_steps_is_optional_positive_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "orchestrator.json"
@@ -284,7 +342,7 @@ class PiOrchestratorConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "rpc_server_command": ["python", "pi_agent/rpc_server.py"],
-                        "model": {"provider": "opencode_go"},
+                        "model": {"provider": "opencode_go", "id_slot": 0},
                         "agent_context": {
                             "enabled": True,
                             "compaction_token_threshold": 1234,
@@ -300,6 +358,7 @@ class PiOrchestratorConfigTests(unittest.TestCase):
         self.assertTrue(config.agent_context.enabled)
         self.assertEqual(config.agent_context.compaction_token_threshold, 1234)
         self.assertTrue(config.agent_context.prompt_cache)
+        self.assertEqual(config.model.id_slot, 0)
 
     def test_opencode_go_provider_uses_go_endpoint_and_key_env_defaults(self):
         old_key = os.environ.get("OPENCODE_API_KEY")
@@ -321,6 +380,23 @@ class PiOrchestratorConfigTests(unittest.TestCase):
         self.assertEqual(provider.config.base_url, "https://opencode.ai/zen/go/v1")
         self.assertEqual(provider.config.api_key_env, "OPENCODE_API_KEY")
         self.assertEqual(provider.config.response_format, "json_object")
+
+    def test_llama_server_provider_uses_local_endpoint_without_api_key(self):
+        old_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            provider = orchestrator.make_provider(
+                orchestrator.ModelConfig(provider="llama_server", model="qwen35-9b")
+            )
+        finally:
+            if old_key is not None:
+                os.environ["OPENAI_API_KEY"] = old_key
+
+        self.assertIsInstance(provider, orchestrator.LlamaServerProvider)
+        self.assertEqual(provider.config.base_url, "http://127.0.0.1:8080/v1")
+        self.assertEqual(provider.api_key, "")
+        self.assertEqual(provider.config.response_format, "json_object")
+        self.assertTrue(provider.config.cache_prompt)
+        self.assertEqual(provider.config.max_tokens, 20000)
 
     def test_opencode_go_provider_reads_bridge_auth_file(self):
         old_home = os.environ.get("HOME")
@@ -359,6 +435,23 @@ class FakeChatProvider(orchestrator.OpenAICompatibleChatProvider):
         self.config = config
         self.schema = {"type": "object"}
         self.api_key = "test-key"
+        self.responses = list(responses)
+        self.payloads = []
+
+    def _post_json(self, url, payload):
+        del url
+        self.payloads.append(payload)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class FakeLlamaServerProvider(orchestrator.LlamaServerProvider):
+    def __init__(self, config, responses):
+        self.config = config
+        self.schema = {"type": "object"}
+        self.api_key = ""
         self.responses = list(responses)
         self.payloads = []
 
@@ -452,6 +545,58 @@ class PiOrchestratorResponseFormatTests(unittest.TestCase):
 
         self.assertNotIn("response_format", provider.payloads[0])
 
+    def test_llama_server_payload_enables_cache_prompt_and_disables_thinking(self):
+        provider = FakeLlamaServerProvider(
+            orchestrator.ModelConfig(
+                provider="llama_server",
+                model="qwen35-9b",
+                base_url="http://127.0.0.1:8080/v1",
+                response_format="json_object",
+                max_tokens=20000,
+                cache_prompt=True,
+                id_slot=0,
+            ),
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"action_ref":"0","rationale":"ok"}'
+                            }
+                        }
+                    ]
+                }
+            ],
+        )
+
+        provider.complete_json("prompt", orchestrator.ModelCallOptions(thinking=False))
+
+        self.assertTrue(provider.payloads[0]["cache_prompt"])
+        self.assertEqual(provider.payloads[0]["id_slot"], 0)
+        self.assertEqual(provider.payloads[0]["max_tokens"], 20000)
+        self.assertEqual(
+            provider.payloads[0]["chat_template_kwargs"],
+            {"enable_thinking": False},
+        )
+
+    def test_llama_server_auto_thinking_depends_on_action_count(self):
+        model = orchestrator.ModelConfig(
+            provider="llama_server",
+            model="qwen35-9b",
+            thinking_mode="auto",
+            no_thinking_action_threshold=2,
+        )
+
+        easy = orchestrator.model_call_options_for_actions(
+            model, [{"id": "0"}, {"id": "1"}]
+        )
+        branchy = orchestrator.model_call_options_for_actions(
+            model, [{"id": "0"}, {"id": "1"}, {"id": "2"}]
+        )
+
+        self.assertFalse(easy.thinking)
+        self.assertTrue(branchy.thinking)
+
     def test_cached_prompt_tokens_are_parsed_from_usage_details(self):
         completion = orchestrator._completion_from_text(
             {
@@ -460,6 +605,22 @@ class PiOrchestratorResponseFormatTests(unittest.TestCase):
                     "completion_tokens": 20,
                     "prompt_tokens_details": {"cached_tokens": 1536},
                 }
+            },
+            '{"action_ref":"0","rationale":"ok"}',
+            {"model": "x"},
+        )
+
+        self.assertEqual(completion.input_tokens, 2000)
+        self.assertEqual(completion.cached_input_tokens, 1536)
+
+    def test_cached_prompt_tokens_are_parsed_from_llama_timings(self):
+        completion = orchestrator._completion_from_text(
+            {
+                "usage": {
+                    "prompt_tokens": 2000,
+                    "completion_tokens": 20,
+                },
+                "timings": {"cache_n": 1536},
             },
             '{"action_ref":"0","rationale":"ok"}',
             {"model": "x"},
@@ -565,8 +726,8 @@ class MalformedJsonProvider(orchestrator.ModelProvider):
         self.calls = 0
         self.failures_before_success = failures_before_success
 
-    def complete_json(self, prompt):
-        del prompt
+    def complete_json(self, prompt, options=None):
+        del prompt, options
         self.calls += 1
         if (
             self.failures_before_success is not None
@@ -582,6 +743,26 @@ class MalformedJsonProvider(orchestrator.ModelProvider):
             "model returned invalid decision JSON: bad",
             raw_response={"bad": True, "call": self.calls},
             response_text='{"action_ref":"0", "memory_updates": [}',
+            request_payload={"model": "x"},
+        )
+
+
+class SequencedDecisionProvider(orchestrator.ModelProvider):
+    def __init__(self, decisions):
+        self.decisions = list(decisions)
+        self.calls = 0
+        self.prompts = []
+
+    def complete_json(self, prompt, options=None):
+        del options
+        self.prompts.append(prompt)
+        decision = self.decisions.pop(0)
+        self.calls += 1
+        response_text = json.dumps(decision)
+        return orchestrator.ModelCompletion(
+            decision=decision,
+            raw_response={"call": self.calls},
+            response_text=response_text,
             request_payload={"model": "x"},
         )
 
@@ -640,6 +821,103 @@ class PiOrchestratorModelResponseRetryTests(unittest.TestCase):
         self.assertEqual(completion.decision["action_ref"], "")
         self.assertIn('"memory_updates"', completion.response_text)
         self.assertTrue(records[-1]["final_attempt"])
+
+    def test_empty_chat_content_is_retried_as_model_response_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "decisions.jsonl"
+            provider = FakeChatProvider(
+                orchestrator.ModelConfig(
+                    provider="openai_compatible_chat",
+                    model="model",
+                    base_url="https://example.test/v1",
+                    response_format="json_object",
+                ),
+                [
+                    {"choices": [{"message": {"content": ""}}]},
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": '{"action_ref":"0","rationale":"ok"}'
+                                }
+                            }
+                        ]
+                    },
+                ],
+            )
+
+            with mock.patch("time.sleep") as sleep:
+                completion = orchestrator.complete_with_response_retries(
+                    provider,
+                    self._config(log_path),
+                    "prompt",
+                    9,
+                )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(completion.decision["action_ref"], "0")
+        self.assertEqual(len(provider.payloads), 2)
+        self.assertIn("empty message content", records[0]["error"])
+        sleep.assert_called_once_with(orchestrator.MODEL_DECISION_PARSE_RETRY_DELAY)
+
+    def test_invalid_decision_is_retried_with_validation_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "decisions.jsonl"
+            provider = SequencedDecisionProvider(
+                [
+                    {"action_ref": "not_legal", "rationale": "bad"},
+                    {"action_ref": "proceed", "rationale": "fixed"},
+                ]
+            )
+
+            with mock.patch("time.sleep") as sleep:
+                (
+                    completion,
+                    action_ref,
+                    validation_error,
+                    prompt,
+                    model_calls,
+                ) = orchestrator.complete_with_decision_retries(
+                    provider,
+                    self._config(log_path),
+                    "base prompt",
+                    10,
+                    None,
+                    [
+                        {
+                            "index": 0,
+                            "id": "proceed",
+                            "label": "Proceed",
+                            "category": "proceed",
+                            "enabled": True,
+                        }
+                    ],
+                    {"state": {"state_type": "event"}},
+                    {},
+                    None,
+                )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(completion.decision["action_ref"], "proceed")
+        self.assertEqual(action_ref, "proceed")
+        self.assertIsNone(validation_error)
+        self.assertEqual(model_calls, 2)
+        self.assertIn("Correction required:", provider.prompts[1])
+        self.assertIn("model chose illegal action_ref", provider.prompts[1])
+        self.assertIn('"not_legal"', provider.prompts[1])
+        self.assertIn('"proceed"', provider.prompts[1])
+        self.assertEqual(prompt, provider.prompts[1])
+        self.assertEqual(records[0]["event"], "invalid_model_decision")
+        self.assertFalse(records[0]["final_attempt"])
+        sleep.assert_called_once_with(orchestrator.MODEL_DECISION_PARSE_RETRY_DELAY)
 
 
 class FakeRpc:
@@ -1087,6 +1365,63 @@ class PiOrchestratorSnapshotRetryTests(unittest.TestCase):
         self.assertIn("Full active run state.", prompt)
         self.assertIn('"STRATEGY.md"', prompt)
         self.assertIn("Full durable playbook.", prompt)
+
+    def test_build_prompt_inserts_active_ascension_effect_stack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {
+                    "state": {
+                        "state_type": "map",
+                        "run": {"ascension": 4},
+                    },
+                    "actions": [{"id": "0"}],
+                },
+                {"CURRENT_RUN.md": "# Current Run\n\nActive.\n"},
+            )
+
+        self.assertIn("Active ascension effects:", prompt)
+        self.assertIn("Current ascension: A4", prompt)
+        self.assertIn("Effects stack; all A1-A4 entries below are active.", prompt)
+        self.assertIn("A1 Swarming Elites", prompt)
+        self.assertIn("A4 Tight Belt", prompt)
+        self.assertNotIn("A5 Ascender's Bane", prompt)
+        self.assertLess(prompt.index("Active ascension effects:"), prompt.rindex("Snapshot:"))
+
+    def test_build_prompt_uses_action_request_ascension_before_run_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            template = Path(tmp) / "prompt.md"
+            template.write_text(
+                "Memory:\n{{MEMORY_JSON}}\nSnapshot:\n{{SNAPSHOT_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            prompt = orchestrator.build_prompt(
+                str(template),
+                {
+                    "state": {"state_type": "menu", "menu_screen": "custom_run"},
+                    "actions": [
+                        {
+                            "id": "menu:confirm",
+                            "request": {
+                                "action": "menu_select",
+                                "option": "Confirm",
+                                "ascension": 10,
+                            },
+                        }
+                    ],
+                },
+                {},
+            )
+
+        self.assertIn("Current ascension: A10", prompt)
+        self.assertIn("A10 Double Boss", prompt)
 
     def test_refinement_prompt_contains_full_memory_files_in_same_prompt(self):
         current_run = "# Current Run\n\nFull run details before reward.\n"
@@ -2398,6 +2733,34 @@ class MemoryCommitTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
             ).stdout.strip()
             self.assertEqual(branch, "memory/test-condition")
+
+    def test_run_id_includes_model_name(self):
+        cases = [
+            (
+                "qwen35-9b",
+                "llama_server",
+                "pi-agent:llama-server:qwen35-9b:s1:a0:12345",
+            ),
+            (
+                "deepseek-v4-flash",
+                "opencode_go",
+                "pi-agent:opencode-go:deepseek-v4-flash:s1:a0:12345",
+            ),
+        ]
+        for model_name, condition_name, expected in cases:
+            with self.subTest(model_name=model_name):
+                config = main.HarnessConfig(
+                    run_setup=main.RunSetup(seed="S1", ascension=0),
+                    agent=main.AgentConfig(
+                        agent_name="pi-agent",
+                        model_name=model_name,
+                        condition_name=condition_name,
+                    ),
+                )
+
+                run_id = main._run_id(config, {"actual": {"start_time": 12345}})
+
+                self.assertEqual(run_id, expected)
 
     def test_room_checkpoint_commits_once_per_floor(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -475,6 +475,12 @@ def _slug(value: Any) -> str:
     return "_".join("".join(chars).split("_")).strip("_") or "action"
 
 
+def _run_slug(value: Any) -> str:
+    text = str(value).strip().lower()
+    chars = [ch if ch.isalnum() or ch == "-" else "-" for ch in text]
+    return "-".join("".join(chars).split("-")).strip("-") or "run"
+
+
 def _player(state: JsonDict) -> JsonDict:
     player = state.get("player")
     return player if isinstance(player, dict) else {}
@@ -2080,11 +2086,12 @@ def _run_id(config: HarnessConfig, verification: JsonDict | None = None) -> str:
     parts = [
         config.agent.agent_name or "agent",
         config.agent.condition_name or "condition",
+        config.agent.model_name or "model",
         seed,
         f"a{ascension if ascension is not None else 'x'}",
         str(start_time),
     ]
-    return ":".join(_slug(part) for part in parts)
+    return ":".join(_run_slug(part) for part in parts)
 
 
 def _state_floor(state: JsonDict) -> int | None:

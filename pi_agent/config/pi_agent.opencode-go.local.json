@@ -1,0 +1,8 @@
+{
+  "harness_config": "sts2harness.opencode-go.json",
+  "memory_root": "pi_agent/memory",
+  "base_url": "http://localhost:15526",
+  "timeout": 30,
+  "mcp_delay": 0.25,
+  "wait_after_action": 0.25
+}

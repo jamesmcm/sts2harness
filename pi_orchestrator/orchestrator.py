@@ -25,6 +25,8 @@ OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
 OPENCODE_GO_DEFAULT_MODEL = "deepseek-v4-flash"
 OPENCODE_GO_API_KEY_ENV = "OPENCODE_API_KEY"
 OPENCODE_GO_AUTH_PROVIDERS = ("opencode-go", "oc-sdk-go")
+LLAMA_SERVER_BASE_URL = "http://127.0.0.1:8080/v1"
+LLAMA_SERVER_DEFAULT_MODEL = "qwen35-9b"
 WRITABLE_MEMORY_FILES = frozenset(
     {"STRATEGY.md", "CURRENT_RUN.md", "BATTLE_LOG.md", "HARNESS_BUGS.md"}
 )
@@ -34,6 +36,18 @@ TRANSIENT_MODEL_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503
 MODEL_DECISION_PARSE_RETRIES = 2
 MODEL_DECISION_PARSE_RETRY_DELAY = 2.0
 DEFAULT_CONTEXT_COMPACTION_TOKENS = 900_000
+ASCENSION_EFFECTS: tuple[tuple[str, str], ...] = (
+    ("Swarming Elites", "Elites spawn more often."),
+    ("Weary Traveler", "Ancients heal only 80% of missing HP."),
+    ("Poverty", "Enemies and treasure chests drop 25% less gold."),
+    ("Tight Belt", "Start each run with 1 fewer potion slot."),
+    ("Ascender's Bane", "Start each run cursed."),
+    ("Inflation", "Merchant card removal is more expensive."),
+    ("Scarcity", "Rare and upgraded cards appear less often."),
+    ("Tough Enemies", "All enemies have increased max HP."),
+    ("Deadly Enemies", "All enemies deal more damage."),
+    ("Double Boss", "Fight two bosses at the end of Act 3."),
+)
 MEMORY_FILE_TEMPLATES = {
     "CURRENT_RUN.md": (
         "# Current Run\n\n"
@@ -60,14 +74,26 @@ class ModelConfig:
     api_key_env: str | None = None
     base_url: str | None = None
     response_format: str | None = None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    cache_prompt: bool | None = None
+    id_slot: int | None = None
+    thinking_mode: str | None = None
+    no_thinking_action_threshold: int = 2
     timeout: float = 300.0
     retry_backoffs: tuple[float, ...] = DEFAULT_MODEL_RETRY_BACKOFFS
+
+
+@dataclass(frozen=True)
+class ModelCallOptions:
+    thinking: bool | None = None
 
 
 @dataclass(frozen=True)
 class AgentContextConfig:
     enabled: bool = False
     compaction_token_threshold: int = DEFAULT_CONTEXT_COMPACTION_TOKENS
+    context_window_tokens: int | None = None
     prompt_cache: bool = True
 
 
@@ -102,17 +128,32 @@ def load_config(path: str | Path) -> OrchestratorConfig:
     command = raw.get("rpc_server_command")
     if not isinstance(command, list) or not command:
         raise ValueError("config.rpc_server_command must be a non-empty list")
+    provider = str(model_raw.get("provider") or "openai_responses")
+    model_config = ModelConfig(
+        provider=provider,
+        model=_model_name(model_raw),
+        api_key_env=_optional_str(model_raw.get("api_key_env")),
+        base_url=_optional_str(model_raw.get("base_url")),
+        response_format=_optional_str(model_raw.get("response_format")),
+        max_tokens=_optional_positive_int(model_raw.get("max_tokens")),
+        context_window_tokens=_optional_positive_int(
+            model_raw.get("context_window_tokens")
+        ),
+        cache_prompt=_optional_bool(model_raw.get("cache_prompt")),
+        id_slot=_optional_nonnegative_int(
+            model_raw.get("id_slot", model_raw.get("slot_id"))
+        ),
+        thinking_mode=_thinking_mode(model_raw.get("thinking_mode"), provider),
+        no_thinking_action_threshold=_optional_positive_int(
+            model_raw.get("no_thinking_action_threshold")
+        )
+        or 2,
+        timeout=float(model_raw.get("timeout", 300.0)),
+        retry_backoffs=_retry_backoffs(model_raw.get("retry_backoffs")),
+    )
     return OrchestratorConfig(
         rpc_server_command=[str(part) for part in command],
-        model=ModelConfig(
-            provider=str(model_raw.get("provider") or "openai_responses"),
-            model=_model_name(model_raw),
-            api_key_env=_optional_str(model_raw.get("api_key_env")),
-            base_url=_optional_str(model_raw.get("base_url")),
-            response_format=_optional_str(model_raw.get("response_format")),
-            timeout=float(model_raw.get("timeout", 300.0)),
-            retry_backoffs=_retry_backoffs(model_raw.get("retry_backoffs")),
-        ),
+        model=model_config,
         max_steps=_optional_positive_int(raw.get("max_steps")),
         stop_on_game_over=bool(raw.get("stop_on_game_over", True)),
         empty_action_max_wait=float(raw.get("empty_action_max_wait", 20.0)),
@@ -124,27 +165,73 @@ def load_config(path: str | Path) -> OrchestratorConfig:
             raw.get("prompt_template")
             or HARNESS_ROOT / "pi_orchestrator" / "prompts" / "decision_prompt.md"
         ),
-        agent_context=_agent_context_config(raw.get("agent_context")),
+        agent_context=_agent_context_config(raw.get("agent_context"), model_config),
     )
 
 
-def _agent_context_config(value: Any) -> AgentContextConfig:
+def _agent_context_config(value: Any, model: ModelConfig) -> AgentContextConfig:
+    default_threshold = _default_context_compaction_tokens(model)
+    default_limit = model.context_window_tokens or _default_context_window_tokens(model)
     if value is None:
-        return AgentContextConfig()
+        return AgentContextConfig(
+            compaction_token_threshold=default_threshold,
+            context_window_tokens=default_limit,
+        )
     if isinstance(value, bool):
-        return AgentContextConfig(enabled=value)
+        return AgentContextConfig(
+            enabled=value,
+            compaction_token_threshold=default_threshold,
+            context_window_tokens=default_limit,
+        )
     if not isinstance(value, dict):
         raise ValueError("config.agent_context must be a boolean or object")
-    threshold = int(
-        value.get("compaction_token_threshold", DEFAULT_CONTEXT_COMPACTION_TOKENS)
+    context_window_tokens = (
+        _optional_positive_int(value.get("context_window_tokens"))
+        or model.context_window_tokens
+        or _default_context_window_tokens(model)
     )
+    threshold = int(value.get("compaction_token_threshold") or 0)
+    if threshold <= 0:
+        threshold = _context_compaction_tokens_for_limit(context_window_tokens)
+    if threshold <= 0:
+        threshold = default_threshold
     if threshold <= 0:
         raise ValueError("config.agent_context.compaction_token_threshold must be > 0")
     return AgentContextConfig(
         enabled=bool(value.get("enabled", False)),
         compaction_token_threshold=threshold,
+        context_window_tokens=context_window_tokens,
         prompt_cache=bool(value.get("prompt_cache", True)),
     )
+
+
+def _default_context_window_tokens(model: ModelConfig) -> int | None:
+    if model.provider == "opencode_go":
+        return 1_000_000
+    if model.provider == "llama_server":
+        return 32_000
+    return None
+
+
+def _default_context_compaction_tokens(model: ModelConfig) -> int:
+    limit = model.context_window_tokens or _default_context_window_tokens(model)
+    if limit is not None:
+        threshold = _context_compaction_tokens_for_limit(limit)
+        reserved_output = model.max_tokens
+        if reserved_output is None and model.provider == "llama_server":
+            reserved_output = 20_000
+        if reserved_output is not None:
+            threshold = min(threshold, max(1, limit - reserved_output - 4_000))
+        return threshold
+    return DEFAULT_CONTEXT_COMPACTION_TOKENS
+
+
+def _context_compaction_tokens_for_limit(limit: int | None) -> int:
+    if limit is None:
+        return DEFAULT_CONTEXT_COMPACTION_TOKENS
+    if limit >= 200_000:
+        return max(1, int(limit * 0.8))
+    return max(1, int(limit * 0.75))
 
 
 def _optional_str(value: Any) -> str | None:
@@ -159,6 +246,36 @@ def _optional_positive_int(value: Any) -> int | None:
         return None
     result = int(value)
     return result if result > 0 else None
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    result = int(value)
+    return result if result >= 0 else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError("boolean config values must be true or false")
+
+
+def _thinking_mode(value: Any, provider: str) -> str | None:
+    if value is None:
+        return "auto" if provider == "llama_server" else None
+    mode = str(value).strip().lower()
+    if mode in {"auto", "enabled", "disabled"}:
+        return mode
+    raise ValueError("config.model.thinking_mode must be auto, enabled, or disabled")
 
 
 def _retry_backoffs(value: Any) -> tuple[float, ...]:
@@ -179,8 +296,11 @@ def _model_name(model_raw: JsonDict) -> str:
     value = _optional_str(model_raw.get("model"))
     if value is not None:
         return value
-    if str(model_raw.get("provider") or "") == "opencode_go":
+    provider = str(model_raw.get("provider") or "")
+    if provider == "opencode_go":
         return OPENCODE_GO_DEFAULT_MODEL
+    if provider == "llama_server":
+        return LLAMA_SERVER_DEFAULT_MODEL
     raise ValueError("config.model.model is required")
 
 
@@ -234,7 +354,9 @@ class JsonRpcClient:
 
 
 class ModelProvider:
-    def complete_json(self, prompt: str) -> "ModelCompletion":
+    def complete_json(
+        self, prompt: str, options: ModelCallOptions | None = None
+    ) -> "ModelCompletion":
         raise NotImplementedError
 
 
@@ -283,11 +405,15 @@ class HttpJsonProvider(ModelProvider):
         self.schema = _load_json(
             HARNESS_ROOT / "pi_orchestrator" / "schemas" / "decision.schema.json"
         )
-        env_name = config.api_key_env or "OPENAI_API_KEY"
-        api_key = self._resolve_api_key(env_name)
-        if not api_key:
+        requires_key = self._requires_api_key()
+        env_name = config.api_key_env or ("OPENAI_API_KEY" if requires_key else "")
+        api_key = self._resolve_api_key(env_name) if env_name else None
+        if not api_key and requires_key:
             raise RuntimeError(self._missing_api_key_message(env_name))
-        self.api_key = api_key
+        self.api_key = api_key or ""
+
+    def _requires_api_key(self) -> bool:
+        return True
 
     def _resolve_api_key(self, env_name: str) -> str | None:
         return os.environ.get(env_name)
@@ -338,16 +464,13 @@ class HttpJsonProvider(ModelProvider):
         self, method: str, url: str, payload: JsonDict | None
     ) -> urllib.request.Request:
         data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": HTTP_USER_AGENT,
-            },
-            method=method,
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": HTTP_USER_AGENT,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
         return request
 
     def _should_retry_http(self, code: int, attempt: int) -> bool:
@@ -373,7 +496,10 @@ class HttpJsonProvider(ModelProvider):
 
 
 class OpenAIResponsesProvider(HttpJsonProvider):
-    def complete_json(self, prompt: str) -> ModelCompletion:
+    def complete_json(
+        self, prompt: str, options: ModelCallOptions | None = None
+    ) -> ModelCompletion:
+        del options
         base_url = self.config.base_url or "https://api.openai.com/v1"
         payload: JsonDict = {
             "model": self.config.model,
@@ -412,13 +538,15 @@ class OpenAIResponsesProvider(HttpJsonProvider):
 
 
 class OpenAICompatibleChatProvider(HttpJsonProvider):
-    def complete_json(self, prompt: str) -> ModelCompletion:
+    def complete_json(
+        self, prompt: str, options: ModelCallOptions | None = None
+    ) -> ModelCompletion:
         if not self.config.base_url:
             raise RuntimeError("openai_compatible_chat requires model.base_url")
         modes = self._response_format_modes()
         last_error: RuntimeError | None = None
         for mode in modes:
-            payload = self._chat_payload(prompt, mode)
+            payload = self._chat_payload(prompt, mode, options)
             try:
                 response = self._post_json(
                     f"{self.config.base_url.rstrip('/')}/chat/completions", payload
@@ -439,7 +567,13 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
             return ["json_schema", "json_object", "none"]
         return [mode]
 
-    def _chat_payload(self, prompt: str, response_format: str) -> JsonDict:
+    def _chat_payload(
+        self,
+        prompt: str,
+        response_format: str,
+        options: ModelCallOptions | None = None,
+    ) -> JsonDict:
+        del options
         payload: JsonDict = {
             "model": self.config.model,
             "messages": [
@@ -449,6 +583,8 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
                 }
             ],
         }
+        if self.config.max_tokens is not None:
+            payload["max_tokens"] = self.config.max_tokens
         if response_format == "json_schema":
             payload["response_format"] = {
                 "type": "json_schema",
@@ -476,8 +612,20 @@ class OpenAICompatibleChatProvider(HttpJsonProvider):
             )
             if isinstance(message, dict) and isinstance(message.get("content"), str):
                 text = message["content"]
-                return _completion_from_text(response, text, payload)
-        raise RuntimeError("OpenAI-compatible API returned no message content")
+                if text.strip():
+                    return _completion_from_text(response, text, payload)
+                raise ModelResponseFormatError(
+                    "OpenAI-compatible API returned empty message content",
+                    raw_response=response,
+                    response_text=text,
+                    request_payload=payload,
+                )
+        raise ModelResponseFormatError(
+            "OpenAI-compatible API returned no message content",
+            raw_response=response,
+            response_text="",
+            request_payload=payload,
+        )
 
 
 def _response_format_unavailable(exc: RuntimeError) -> bool:
@@ -494,13 +642,22 @@ class OpenRouterProvider(OpenAICompatibleChatProvider):
             model=config.model,
             api_key_env=config.api_key_env or "OPENROUTER_API_KEY",
             base_url=config.base_url or "https://openrouter.ai/api/v1",
+            response_format=config.response_format,
+            max_tokens=config.max_tokens,
+            context_window_tokens=config.context_window_tokens,
+            cache_prompt=config.cache_prompt,
+            id_slot=config.id_slot,
+            thinking_mode=config.thinking_mode,
+            no_thinking_action_threshold=config.no_thinking_action_threshold,
             timeout=config.timeout,
             retry_backoffs=config.retry_backoffs,
         )
         super().__init__(config)
 
-    def complete_json(self, prompt: str) -> ModelCompletion:
-        completion = super().complete_json(prompt)
+    def complete_json(
+        self, prompt: str, options: ModelCallOptions | None = None
+    ) -> ModelCompletion:
+        completion = super().complete_json(prompt, options)
         generation_id = completion.generation_id or completion.response_id
         generation_stats = completion.generation_stats
         generation_content = completion.generation_content
@@ -541,6 +698,12 @@ class OpenCodeGoProvider(OpenAICompatibleChatProvider):
             api_key_env=config.api_key_env or OPENCODE_GO_API_KEY_ENV,
             base_url=config.base_url or OPENCODE_GO_BASE_URL,
             response_format=config.response_format or "json_object",
+            max_tokens=config.max_tokens,
+            context_window_tokens=config.context_window_tokens,
+            cache_prompt=config.cache_prompt,
+            id_slot=config.id_slot,
+            thinking_mode=config.thinking_mode,
+            no_thinking_action_threshold=config.no_thinking_action_threshold,
             timeout=config.timeout,
             retry_backoffs=config.retry_backoffs,
         )
@@ -567,6 +730,46 @@ class OpenCodeGoProvider(OpenAICompatibleChatProvider):
             "or save a key in ~/.local/share/opencode/auth.json "
             "or ~/.pi/agent/auth.json."
         )
+
+
+class LlamaServerProvider(OpenAICompatibleChatProvider):
+    def __init__(self, config: ModelConfig) -> None:
+        config = ModelConfig(
+            provider=config.provider,
+            model=config.model or LLAMA_SERVER_DEFAULT_MODEL,
+            api_key_env=config.api_key_env,
+            base_url=config.base_url or LLAMA_SERVER_BASE_URL,
+            response_format=config.response_format or "json_object",
+            max_tokens=config.max_tokens or 20_000,
+            context_window_tokens=config.context_window_tokens or 32_000,
+            cache_prompt=True if config.cache_prompt is None else config.cache_prompt,
+            id_slot=config.id_slot,
+            thinking_mode=config.thinking_mode or "auto",
+            no_thinking_action_threshold=config.no_thinking_action_threshold,
+            timeout=config.timeout,
+            retry_backoffs=config.retry_backoffs,
+        )
+        super().__init__(config)
+
+    def _requires_api_key(self) -> bool:
+        return bool(self.config.api_key_env)
+
+    def _chat_payload(
+        self,
+        prompt: str,
+        response_format: str,
+        options: ModelCallOptions | None = None,
+    ) -> JsonDict:
+        payload = super()._chat_payload(prompt, response_format, options)
+        if self.config.cache_prompt:
+            payload["cache_prompt"] = True
+        if self.config.id_slot is not None:
+            payload["id_slot"] = self.config.id_slot
+        if options is not None and options.thinking is not None:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": options.thinking,
+            }
+        return payload
 
 
 def _read_opencode_go_auth_key() -> str | None:
@@ -600,9 +803,11 @@ def make_provider(config: ModelConfig) -> ModelProvider:
         return OpenCodeGoProvider(config)
     if config.provider == "openrouter":
         return OpenRouterProvider(config)
+    if config.provider == "llama_server":
+        return LlamaServerProvider(config)
     raise ValueError(
         "model.provider must be openai_responses, openai_compatible_chat, "
-        "opencode_go, or openrouter"
+        "opencode_go, openrouter, or llama_server"
     )
 
 
@@ -649,6 +854,9 @@ def _completion_from_response(
     usage = response.get("usage")
     if not isinstance(usage, dict):
         usage = {}
+    timings = response.get("timings")
+    if not isinstance(timings, dict):
+        timings = {}
     response_id = _optional_str(response.get("id"))
     return ModelCompletion(
         decision=decision,
@@ -664,6 +872,7 @@ def _completion_from_response(
             _usage_nested_int(usage, "input_tokens_details", "cached_tokens")
             or _usage_nested_int(usage, "prompt_tokens_details", "cached_tokens")
             or _usage_int(usage, "cached_input_tokens", "cached_prompt_tokens")
+            or _usage_int(timings, "cache_n")
         ),
         output_tokens=_usage_int(
             usage, "output_tokens", "completion_tokens", "total_output_tokens"
@@ -817,12 +1026,79 @@ def build_prompt(template_path: str, snapshot: JsonDict, memory: JsonDict) -> st
         prompt = _insert_before_snapshot(
             prompt, f"\n\nLifecycle requirement:\n{lifecycle_requirement}\n"
         )
+    ascension_requirement = build_ascension_effects_section(snapshot)
+    if ascension_requirement:
+        prompt = _insert_before_snapshot(prompt, f"\n\n{ascension_requirement}\n")
     if objective_battle_log is not None:
         prompt += (
             "\n\nObjective battle log:\n"
             f"{json.dumps(objective_battle_log, indent=2, sort_keys=True)}\n"
         )
     return prompt
+
+
+def build_ascension_effects_section(snapshot: JsonDict) -> str | None:
+    ascension = _snapshot_ascension(snapshot)
+    if ascension is None:
+        return None
+    if ascension <= 0:
+        return (
+            "Active ascension effects:\n"
+            "- Current ascension: A0.\n"
+            "- No ascension modifiers are active."
+        )
+    active_level = min(ascension, len(ASCENSION_EFFECTS))
+    lines = [
+        "Active ascension effects:",
+        f"- Current ascension: A{ascension}. Effects stack; all A1-A{active_level} entries below are active.",
+    ]
+    for index, (name, effect) in enumerate(ASCENSION_EFFECTS[:active_level], 1):
+        lines.append(f"- A{index} {name}: {effect}")
+    if ascension > len(ASCENSION_EFFECTS):
+        lines.append(
+            f"- A{len(ASCENSION_EFFECTS) + 1}+ effects are not known to this harness; "
+            "trust explicit ascension data in the snapshot if present."
+        )
+    return "\n".join(lines)
+
+
+def _snapshot_ascension(snapshot: JsonDict) -> int | None:
+    for value in _ascension_candidates(snapshot):
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def _ascension_candidates(snapshot: JsonDict) -> list[Any]:
+    candidates: list[Any] = [snapshot.get("ascension")]
+    for key in ("state", "run", "run_setup"):
+        value = snapshot.get(key)
+        if isinstance(value, dict):
+            _append_ascension_candidates(candidates, value)
+    verification = snapshot.get("run_setup_verification")
+    if isinstance(verification, dict):
+        for key in ("actual", "expected"):
+            value = verification.get(key)
+            if isinstance(value, dict):
+                _append_ascension_candidates(candidates, value)
+    actions = snapshot.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            request = action.get("request")
+            if isinstance(request, dict):
+                candidates.append(request.get("ascension"))
+    return candidates
+
+
+def _append_ascension_candidates(candidates: list[Any], data: JsonDict) -> None:
+    for key in ("ascension", "ascension_level", "ascensionLevel"):
+        candidates.append(data.get(key))
+    for key in ("run", "current_run", "run_setup"):
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            _append_ascension_candidates(candidates, nested)
 
 
 def _insert_before_snapshot(prompt: str, text: str) -> str:
@@ -850,7 +1126,7 @@ def _snapshot_without_objective_battle_log(
 
 
 def _estimated_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    return max(1, len(text) // 2)
 
 
 def _state_has_active_battle(state: JsonDict) -> bool:
@@ -930,6 +1206,13 @@ class AgentConversation:
     def estimated_tokens_with(self, prompt: str) -> int:
         return _estimated_tokens(self.transcript() + prompt)
 
+    def prune_history_to_fit(self, prompt: str, token_threshold: int) -> int:
+        pruned = 0
+        while self.exchanges and self.estimated_tokens_with(prompt) >= token_threshold:
+            del self.exchanges[0]
+            pruned += 1
+        return pruned
+
     def append_exchange(
         self, prompt: str, completion: ModelCompletion, result_summary: JsonDict
     ) -> None:
@@ -976,6 +1259,7 @@ class AgentContextManager:
         current_prompt = self._with_role_header(base_prompt, role)
         compaction_path = conversation.pending_compaction_path
         compaction_triggered = False
+        history_pruned_exchanges = 0
         estimated_tokens = conversation.estimated_tokens_with(current_prompt)
         if (
             compaction_path is None
@@ -990,6 +1274,9 @@ class AgentContextManager:
                 current_prompt,
                 "\n\nContext compaction requirement:\n"
                 f"{build_context_compaction_requirement(role, compaction_path)}\n",
+            )
+            history_pruned_exchanges = conversation.prune_history_to_fit(
+                current_prompt, self.config.compaction_token_threshold
             )
         transcript = conversation.transcript()
         prompt = self._with_role_header(
@@ -1013,6 +1300,7 @@ class AgentContextManager:
                 "prompt_cache": self.config.prompt_cache,
                 "estimated_tokens": _estimated_tokens(prompt),
                 "history_exchanges": len(conversation.exchanges),
+                "history_pruned_exchanges": history_pruned_exchanges,
                 "compaction_path": compaction_path,
                 "compaction_triggered": compaction_triggered,
             },
@@ -1727,11 +2015,15 @@ def snapshot_with_actions(
 
 
 def complete_with_response_retries(
-    provider: ModelProvider, config: OrchestratorConfig, prompt: str, step: int
+    provider: ModelProvider,
+    config: OrchestratorConfig,
+    prompt: str,
+    step: int,
+    options: ModelCallOptions | None = None,
 ) -> ModelCompletion:
     for attempt in range(MODEL_DECISION_PARSE_RETRIES + 1):
         try:
-            return provider.complete_json(prompt)
+            return provider.complete_json(prompt, options)
         except ModelResponseFormatError as exc:
             final_attempt = attempt >= MODEL_DECISION_PARSE_RETRIES
             append_decision_log(
@@ -1763,6 +2055,144 @@ def complete_with_response_retries(
                 )
             time.sleep(MODEL_DECISION_PARSE_RETRY_DELAY)
     raise RuntimeError("unreachable model response retry state")
+
+
+def complete_with_decision_retries(
+    provider: ModelProvider,
+    config: OrchestratorConfig,
+    prompt: str,
+    step: int,
+    options: ModelCallOptions | None,
+    actions: list[JsonDict],
+    snapshot: JsonDict,
+    memory: JsonDict,
+    conversation: AgentConversation | None,
+) -> tuple[ModelCompletion, str, str | None, str, int]:
+    current_prompt = prompt
+    model_calls = 0
+    for attempt in range(MODEL_DECISION_PARSE_RETRIES + 1):
+        completion = complete_with_response_retries(
+            provider, config, current_prompt, step, options
+        )
+        model_calls += 1
+        action_ref, validation_error = validate_decision(
+            completion.decision, actions, snapshot, memory, conversation
+        )
+        final_attempt = attempt >= MODEL_DECISION_PARSE_RETRIES
+        if validation_error is None or final_attempt:
+            return completion, action_ref, validation_error, current_prompt, model_calls
+        append_decision_log(
+            config.decision_log,
+            {
+                "timestamp": time.time(),
+                "step": step,
+                "event": "invalid_model_decision",
+                "attempt": attempt + 1,
+                "max_attempts": MODEL_DECISION_PARSE_RETRIES + 1,
+                "error": validation_error,
+                "decision": completion.decision,
+                "action_ref": action_ref,
+                "legal_actions": _legal_actions_for_retry(actions),
+                "prompt_hash": _sha256_text(current_prompt),
+                "response_hash": _sha256_json(completion.raw_response),
+                "final_attempt": False,
+            },
+        )
+        current_prompt = _retry_prompt_for_invalid_decision(
+            prompt,
+            validation_error,
+            completion.decision,
+            actions,
+        )
+        time.sleep(MODEL_DECISION_PARSE_RETRY_DELAY)
+    raise RuntimeError("unreachable decision retry state")
+
+
+def validate_decision(
+    decision: JsonDict,
+    actions: list[JsonDict],
+    snapshot: JsonDict,
+    memory: JsonDict,
+    conversation: AgentConversation | None,
+) -> tuple[str, str | None]:
+    action_ref = str(decision.get("action_ref") or "")
+    try:
+        action_ref = validate_action(decision, actions)
+    except ValueError as exc:
+        return action_ref, str(exc)
+    validation_error = validate_memory_lifecycle(decision, snapshot, memory)
+    if validation_error is not None:
+        return action_ref, validation_error
+    if conversation is not None:
+        validation_error = validate_context_compaction(decision, conversation)
+        if validation_error is not None:
+            return action_ref, validation_error
+    validation_error = validate_memory_quality(decision, snapshot, memory)
+    return action_ref, validation_error
+
+
+def _retry_prompt_for_invalid_decision(
+    prompt: str,
+    validation_error: str,
+    decision: JsonDict,
+    actions: list[JsonDict],
+) -> str:
+    correction = {
+        "validation_error": validation_error,
+        "previous_decision": decision,
+        "legal_actions": _legal_actions_for_retry(actions),
+    }
+    return (
+        prompt
+        + "\n\nCorrection required:\n"
+        + "Your previous decision was rejected by the harness. Return corrected "
+        + "decision JSON only. Keep required memory rewrites if the error asks for "
+        + "them, and choose exactly one legal action_ref from the legal_actions list.\n"
+        + json.dumps(correction, indent=2, sort_keys=True)
+        + "\n"
+    )
+
+
+def _legal_actions_for_retry(actions: list[JsonDict]) -> list[JsonDict]:
+    result: list[JsonDict] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        item: JsonDict = {}
+        for key in ("index", "id", "label", "category", "enabled"):
+            if key in action:
+                item[key] = action[key]
+        result.append(item)
+    return result
+
+
+def _context_size_error(exc: RuntimeError) -> bool:
+    text = str(exc).lower()
+    return (
+        "exceed_context_size_error" in text
+        or "exceeds the available context size" in text
+    )
+
+
+def model_call_options_for_actions(
+    model: ModelConfig, actions: list[JsonDict]
+) -> ModelCallOptions:
+    if model.provider != "llama_server":
+        return ModelCallOptions()
+    mode = model.thinking_mode or "auto"
+    if mode == "enabled":
+        return ModelCallOptions(thinking=True)
+    if mode == "disabled":
+        return ModelCallOptions(thinking=False)
+    if mode == "auto":
+        return ModelCallOptions(
+            thinking=len(actions) > model.no_thinking_action_threshold
+        )
+    return ModelCallOptions()
+
+
+def _model_call_options_record(options: ModelCallOptions) -> JsonDict:
+    return {"thinking": options.thinking}
 
 
 def run(config: OrchestratorConfig) -> int:
@@ -1821,24 +2251,78 @@ def run(config: OrchestratorConfig) -> int:
                 ) = context_manager.build_prompt(base_prompt, role)
             else:
                 prompt = base_prompt
+            model_call_options = model_call_options_for_actions(config.model, actions)
             model_started = time.monotonic()
-            completion = complete_with_response_retries(provider, config, prompt, step)
+            try:
+                (
+                    completion,
+                    action_ref,
+                    validation_error,
+                    prompt,
+                    model_calls,
+                ) = complete_with_decision_retries(
+                    provider,
+                    config,
+                    prompt,
+                    step,
+                    model_call_options,
+                    actions,
+                    snapshot,
+                    memory,
+                    conversation,
+                )
+            except RuntimeError as exc:
+                if (
+                    context_manager is None
+                    or conversation is None
+                    or not _context_size_error(exc)
+                ):
+                    raise
+                pruned = len(conversation.exchanges)
+                conversation.exchanges = []
+                if conversation.pending_compaction_path is None:
+                    conversation.pending_compaction_path = context_compaction_target(role)
+                    conversation.pending_compaction_prompted = True
+                append_decision_log(
+                    config.decision_log,
+                    {
+                        "timestamp": time.time(),
+                        "step": step,
+                        "event": "context_size_retry",
+                        "error": str(exc),
+                        "role": role,
+                        "history_pruned_exchanges": pruned,
+                    },
+                )
+                (
+                    prompt,
+                    exchange_prompt,
+                    conversation,
+                    context_record,
+                ) = context_manager.build_prompt(base_prompt, role)
+                context_record["context_size_retry"] = True
+                context_record["history_pruned_exchanges"] = (
+                    int(context_record.get("history_pruned_exchanges") or 0) + pruned
+                )
+                (
+                    completion,
+                    action_ref,
+                    validation_error,
+                    prompt,
+                    model_calls,
+                ) = complete_with_decision_retries(
+                    provider,
+                    config,
+                    prompt,
+                    step,
+                    model_call_options,
+                    actions,
+                    snapshot,
+                    memory,
+                    conversation,
+                )
             model_elapsed_seconds = time.monotonic() - model_started
             decision = completion.decision
-            action_ref = str(decision.get("action_ref") or "")
-            validation_error = None
-            try:
-                action_ref = validate_action(decision, actions)
-            except ValueError as exc:
-                validation_error = str(exc)
-            if validation_error is None:
-                validation_error = validate_memory_lifecycle(
-                    decision, snapshot, memory
-                )
-            if validation_error is None and conversation is not None:
-                validation_error = validate_context_compaction(decision, conversation)
-            if validation_error is None:
-                validation_error = validate_memory_quality(decision, snapshot, memory)
             memory_update_count = 0
             memory_preread_count = 0
             memory_lifecycle: list[JsonDict] = []
@@ -1930,7 +2414,10 @@ def run(config: OrchestratorConfig) -> int:
                     "output_tokens": completion.output_tokens,
                     "model_elapsed_seconds": model_elapsed_seconds,
                     "tool_calls": tool_calls,
-                    "model_calls": 1,
+                    "model_calls": model_calls,
+                    "model_call_options": _model_call_options_record(
+                        model_call_options
+                    ),
                     "agent_context": context_record,
                 },
             )
@@ -1973,8 +2460,12 @@ def run(config: OrchestratorConfig) -> int:
                     "response_hash": _sha256_json(completion.raw_response),
                     "tool_calls": tool_calls,
                     "telemetry": telemetry,
+                    "model_calls": model_calls,
                     "result_summary": result_summary,
                     "memory_lifecycle": memory_lifecycle,
+                    "model_call_options": _model_call_options_record(
+                        model_call_options
+                    ),
                     "agent_context": context_record,
                 },
             )

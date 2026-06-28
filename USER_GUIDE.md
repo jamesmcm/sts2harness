@@ -195,8 +195,8 @@ not logged unless the config has the full official setup:
 - `agent.condition_name`
 - configured seed and ascension
 
-The run ID includes agent, condition, seed, ascension, and run start time. The
-database contains:
+The run ID includes agent, condition, model, seed, ascension, and run start time.
+The database contains:
 
 - `runs`: one row per official run, including seed, ascension, model, condition,
   character, final floor, victory, aggregate action counts, and Pi orchestrator

@@ -1,0 +1,28 @@
+{
+  "rpc_server_command": [
+    "python",
+    "pi_agent/rpc_server.py",
+    "--config",
+    "pi_agent/config/pi_agent.llama-server.local.json"
+  ],
+  "model": {
+    "provider": "llama_server",
+    "model": "qwen35-9b",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "max_tokens": 20000,
+    "context_window_tokens": 48000,
+    "cache_prompt": true,
+    "id_slot": 0,
+    "thinking_mode": "auto",
+    "no_thinking_action_threshold": 2,
+    "timeout": 300
+  },
+  "agent_context": {
+    "enabled": true,
+    "compaction_token_threshold": 24000,
+    "prompt_cache": true
+  },
+  "stop_on_game_over": false,
+  "decision_log": "pi_orchestrator/runs.llama-server.local.jsonl",
+  "prompt_template": "pi_orchestrator/prompts/decision_prompt.md"
+}
